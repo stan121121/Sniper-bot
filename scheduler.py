@@ -1,6 +1,8 @@
 """
-scheduler.py — тик каждую минуту + резервный интервальный запуск
+scheduler.py — тик каждую минуту + резервный интервальный запуск.
+С задержками между пользователями и обработкой ошибок отправки.
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -25,7 +27,8 @@ async def tick(bot: Bot, db: Database):
     if not user_ids:
         return
     logger.info("Tick %02d:%02d — %d users", now.hour, now.minute, len(user_ids))
-    for uid in user_ids:
+
+    for i, uid in enumerate(user_ids):
         channels = await db.get_user_channels(uid)
         try:
             await _send_user_digest(bot, db, None, uid, channels,
@@ -35,10 +38,15 @@ async def tick(bot: Bot, db: Database):
         except Exception as e:
             logger.error("Digest error uid=%d: %s", uid, e)
 
+        # Задержка между пользователями, чтобы не превышать лимиты
+        if i < len(user_ids) - 1:
+            await asyncio.sleep(1.5)
+
 
 async def run_digest(bot: Bot, db: Database):
     """Резервный запуск для пользователей без расписания."""
-    for user in await db.get_all_active_users():
+    users = await db.get_all_active_users()
+    for i, user in enumerate(users):
         uid = user["user_id"]
         if await db.get_user_schedules(uid):
             continue  # есть расписание — пропускаем
@@ -50,6 +58,9 @@ async def run_digest(bot: Bot, db: Database):
                                     settings.DEFAULT_DIGEST_INTERVAL_HOURS)
         except Exception as e:
             logger.error("Interval digest uid=%d: %s", uid, e)
+
+        if i < len(users) - 1:
+            await asyncio.sleep(1.5)
 
 
 async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
@@ -84,12 +95,12 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
         logger.info("User %d: nothing to send.", user_id)
         return
 
-    # 3. Итог дня (только если есть новости)
+    # 3. Итог дня
     day_summary = ""
     if all_items:
         day_summary = await generate_day_summary(all_items, lang=settings.DIGEST_LANGUAGE)
 
-    # 4. Отправка
+    # 4. Отправка (с обработкой ошибок по каждому фрагменту)
     msg = format_digest_message(
         tg_items=tg_items,
         web_items=web_items,
@@ -98,12 +109,17 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
         lang=settings.DIGEST_LANGUAGE,
     )
 
-    # Разбиваем длинные сообщения (лимит Telegram 4096 символов)
-    for chunk in _split_message(msg):
-        await bot.send_message(
-            chat_id=user_id, text=chunk,
-            parse_mode="HTML", disable_web_page_preview=True,
-        )
+    chunks = _split_message(msg)
+    for chunk in chunks:
+        try:
+            await bot.send_message(
+                chat_id=user_id, text=chunk,
+                parse_mode="HTML", disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.error("Failed to send chunk to %d: %s", user_id, e)
+        # Небольшая пауза между фрагментами одного сообщения
+        await asyncio.sleep(0.3)
 
     # 5. Кеш для оффлайн
     for item in all_items:
