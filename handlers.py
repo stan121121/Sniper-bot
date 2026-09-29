@@ -1,5 +1,6 @@
 """
-handlers.py — все команды бота
+handlers.py — все команды бота.
+Исправлено: обработка /add@bot, проверка приватных чатов, очистка кеша.
 """
 import logging
 import re
@@ -20,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 # ── Утилиты ──────────────────────────────────────────────────────
 def he(t: str) -> str:
-    return t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def parse_channel_input(raw: str) -> str | None:
     raw = raw.strip()
@@ -32,7 +34,8 @@ def parse_channel_input(raw: str) -> str | None:
     username = raw.lstrip("@").strip().lower()
     return username if re.match(r"^[A-Za-z0-9_]{3,}$", username) else None
 
-def parse_time(s: str) -> tuple[int,int] | None:
+
+def parse_time(s: str) -> tuple[int, int] | None:
     """Парсит '09:00' или '9' → (9, 0)."""
     s = s.strip()
     if ":" in s:
@@ -54,6 +57,7 @@ def parse_time(s: str) -> tuple[int,int] | None:
 class AddChannel(StatesGroup):
     waiting = State()
 
+
 class AddSchedule(StatesGroup):
     waiting = State()
 
@@ -61,9 +65,9 @@ class AddSchedule(StatesGroup):
 # ── Клавиатура ───────────────────────────────────────────────────
 def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📋 Каналы"),    KeyboardButton(text="➕ Добавить канал")],
+        [KeyboardButton(text="📋 Каналы"), KeyboardButton(text="➕ Добавить канал")],
         [KeyboardButton(text="⏰ Расписание"), KeyboardButton(text="📰 Дайджест сейчас")],
-        [KeyboardButton(text="📚 Кеш статей"),KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="📚 Кеш статей"), KeyboardButton(text="ℹ️ Помощь")],
     ], resize_keyboard=True)
 
 
@@ -72,13 +76,13 @@ def main_kb():
 async def cmd_start(message: Message, db):
     await db.upsert_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        "👋 Привет! Я новостной дайджест-бот.\n\n"
+        "👋 Привет! Я новостной дайджест-бот на DeepSeek.\n\n"
         "<b>Что умею:</b>\n"
         "📱 Читать твои Telegram-каналы\n"
         "🌐 Добавлять важные новости из интернета\n"
         "📊 Делать <b>Итог дня</b>\n"
         "📚 Кешировать статьи для оффлайн-чтения\n"
-        "⏰ Присылать дайджест в нужное время (09:00, 21:00 и т.д.)\n\n"
+        "⏰ Присылать дайджест в нужное время\n\n"
         "Начни с /add чтобы добавить каналы,\n"
         "затем /schedule чтобы задать время дайджеста.",
         parse_mode="HTML", reply_markup=main_kb(),
@@ -101,7 +105,8 @@ async def cmd_help(message: Message):
         "/schedules — показать расписание\n\n"
         "<b>Дайджест:</b>\n"
         "/digest — получить дайджест прямо сейчас\n"
-        "/cache — показать кешированные статьи\n\n"
+        "/cache — показать кешированные статьи\n"
+        "/clearcache — очистить кеш статей\n\n"
         "Время указывается в UTC. Примеры: <code>09:00</code>, <code>21:30</code>",
         parse_mode="HTML",
     )
@@ -123,10 +128,15 @@ async def cmd_channels(message: Message, db):
 @router.message(Command("add"))
 @router.message(F.text == "➕ Добавить канал")
 async def cmd_add_start(message: Message, state: FSMContext, db):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) == 2 and parts[0] == "/add":
+    # Правильный парсинг команды, даже если она с @bot
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    cmd = parts[0].split("@")[0] if parts else ""
+
+    if cmd == "/add" and len(parts) == 2:
         await _do_add(message, parts[1], db=db)
         return
+
     await state.set_state(AddChannel.waiting)
     await message.answer(
         "Отправь username или ссылку:\n"
@@ -134,18 +144,22 @@ async def cmd_add_start(message: Message, state: FSMContext, db):
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove(),
     )
 
+
 @router.message(AddChannel.waiting)
 async def cmd_add_input(message: Message, state: FSMContext, db):
     await state.clear()
     await _do_add(message, message.text.strip(), db=db)
 
+
 async def _do_add(message: Message, raw: str, db=None):
-    if db is None: return
+    if db is None:
+        return
     username = parse_channel_input(raw)
     if not username:
         await message.answer(
             "❌ Не распознан канал.\n"
-            "Формат: <code>@username</code> или <code>https://t.me/username</code>",
+            "Формат: <code>@username</code> или <code>https://t.me/username</code>\n"
+            "Приватные каналы по инвайт-ссылкам не поддерживаются.",
             parse_mode="HTML", reply_markup=main_kb())
         return
     added = await db.add_channel(message.from_user.id, username)
@@ -219,6 +233,7 @@ async def cmd_schedule_add(message: Message, state: FSMContext, db):
         "Например: <code>09:00</code> или <code>21:30</code>",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
+
 @router.message(AddSchedule.waiting)
 async def cmd_schedule_input(message: Message, state: FSMContext, db):
     await state.clear()
@@ -233,7 +248,7 @@ async def cmd_schedule_input(message: Message, state: FSMContext, db):
             f"✅ Дайджест в <b>{t[0]:02d}:{t[1]:02d} UTC</b> добавлен!",
             parse_mode="HTML", reply_markup=main_kb())
     else:
-        await message.answer(f"⚠️ Время уже задано.", reply_markup=main_kb())
+        await message.answer("⚠️ Время уже задано.", reply_markup=main_kb())
 
 
 @router.message(Command("unschedule"))
@@ -298,3 +313,20 @@ async def cmd_cache(message: Message, db):
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=main_kb())
+
+
+@router.message(Command("clearcache"))
+async def cmd_clear_cache(message: Message, db):
+    count = await db.clear_user_cache(message.from_user.id)
+    if count:
+        await message.answer(f"🗑 Удалено статей: <b>{count}</b>",
+                             parse_mode="HTML", reply_markup=main_kb())
+    else:
+        await message.answer("📭 Кеш уже пуст.", reply_markup=main_kb())
+
+
+# ── Защита от команд в группах (опционально) ─────────────────────
+@router.message(F.chat.type != "private")
+async def ignore_non_private(message: Message):
+    # Игнорируем все сообщения в группах/каналах
+    pass
