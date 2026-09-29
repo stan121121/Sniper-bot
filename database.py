@@ -1,5 +1,5 @@
 """
-database.py — SQLite: пользователи, каналы, расписания, кеш статей
+database.py — SQLite с индексами для производительности.
 """
 import aiosqlite
 import logging
@@ -16,6 +16,8 @@ class Database:
     async def init(self):
         async with aiosqlite.connect(self.path) as db:
             await db.executescript("""
+                PRAGMA journal_mode=WAL;
+
                 CREATE TABLE IF NOT EXISTS users (
                     user_id     INTEGER PRIMARY KEY,
                     username    TEXT,
@@ -32,7 +34,6 @@ class Database:
                     UNIQUE(user_id, username)
                 );
 
-                -- Расписание: несколько временных точек на пользователя
                 CREATE TABLE IF NOT EXISTS schedules (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id     INTEGER NOT NULL,
@@ -46,7 +47,7 @@ class Database:
                     user_id     INTEGER NOT NULL,
                     sent_at     TEXT DEFAULT (datetime('now')),
                     news_count  INTEGER,
-                    summary     TEXT   -- "Итог дня"
+                    summary     TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS seen_posts (
@@ -57,7 +58,6 @@ class Database:
                     UNIQUE(user_id, channel, post_id)
                 );
 
-                -- Кеш статей для оффлайн-доступа
                 CREATE TABLE IF NOT EXISTS article_cache (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id     INTEGER NOT NULL,
@@ -68,6 +68,16 @@ class Database:
                     cached_at   TEXT DEFAULT (datetime('now')),
                     UNIQUE(user_id, url)
                 );
+
+                -- Индексы для ускорения запросов
+                CREATE INDEX IF NOT EXISTS idx_seen_user_channel
+                    ON seen_posts(user_id, channel);
+                CREATE INDEX IF NOT EXISTS idx_schedules_user_time
+                    ON schedules(user_id, hour, minute);
+                CREATE INDEX IF NOT EXISTS idx_digest_log_user
+                    ON digest_log(user_id);
+                CREATE INDEX IF NOT EXISTS idx_article_cache_user
+                    ON article_cache(user_id, cached_at DESC);
             """)
             await db.commit()
         logger.info("Database initialized: %s", self.path)
@@ -156,7 +166,6 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_users_for_time(self, hour: int, minute: int) -> list[int]:
-        """Вернуть user_id всех пользователей, у которых расписание совпадает с H:MM."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """SELECT DISTINCT s.user_id FROM schedules s
@@ -231,6 +240,15 @@ class Database:
             )
             await db.commit()
             return cur.rowcount > 0
+
+    async def clear_user_cache(self, user_id: int) -> int:
+        """Удалить все статьи пользователя из кеша."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "DELETE FROM article_cache WHERE user_id=?", (user_id,)
+            )
+            await db.commit()
+            return cur.rowcount
 
     # ── Лог дайджестов ───────────────────────────────────────────
     async def log_digest(self, user_id: int, news_count: int, summary: str = ""):
