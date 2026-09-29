@@ -1,16 +1,6 @@
 """
 channel_reader.py — scraping https://t.me/s/{channel}
 Только stdlib: re + html (NO beautifulsoup, NO telethon)
-
-Реальная структура HTML t.me/s/:
-  <div class="tgme_widget_message_wrap ...">
-    <div class="tgme_widget_message ... " data-post="channel/12345">
-      <div class="tgme_widget_message_text js-message_text">текст поста</div>
-      <a class="tgme_widget_message_date" href="https://t.me/channel/12345">
-        <time datetime="2024-01-01T12:00:00+00:00">...</time>
-      </a>
-    </div>
-  </div>
 """
 import asyncio
 import html as html_stdlib
@@ -46,10 +36,9 @@ class Post:
     url: str
 
 
-# ── Regex-парсер (надёжнее stateful HTMLParser для этой страницы) ─
+# ── Regex-парсер ─────────────────────────────────────────────────
 
 def _strip_tags(s: str) -> str:
-    """Убрать HTML-теги, заменить <br> на \n."""
     s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
     s = re.sub(r"<[^>]+>", "", s)
     return html_stdlib.unescape(s).strip()
@@ -63,11 +52,6 @@ def _parse_dt(iso: str) -> datetime:
 
 
 def _scrape(html: str, username: str) -> list[Post]:
-    """
-    Парсим страницу t.me/s/{username} через регулярки.
-    Telegram генерирует стабильную структуру, regex надёжнее stateful-парсера.
-    """
-    # 1. Название канала
     title_m = re.search(
         r'class="tgme_channel_info_header_title[^"]*"[^>]*>\s*<span[^>]*>([^<]+)</span>',
         html
@@ -77,18 +61,14 @@ def _scrape(html: str, username: str) -> list[Post]:
     channel_title = html_stdlib.unescape(title_m.group(1).strip()) if title_m else username
 
     posts: list[Post] = []
-
-    # 2. Каждый пост — блок между data-post="channel/ID"
-    # Ищем все data-post атрибуты с ID
     post_ids_urls = re.findall(
         r'href="(https://t\.me/' + re.escape(username) + r'/(\d+))"',
         html, re.I
     )
     if not post_ids_urls:
-        logger.debug("@%s: no post links found in HTML (len=%d)", username, len(html))
+        logger.debug("@%s: no post links found", username)
         return []
 
-    # Дедупликация: одна ссылка может встречаться несколько раз (превью и кнопка)
     seen_ids: set[int] = set()
     unique_posts = []
     for url, pid_str in post_ids_urls:
@@ -97,14 +77,10 @@ def _scrape(html: str, username: str) -> list[Post]:
             seen_ids.add(pid)
             unique_posts.append((url, pid))
 
-    # 3. Для каждого ID ищем соответствующий datetime и текст
     for post_url, post_id in unique_posts:
-        # datetime рядом с этой ссылкой
-        # Ищем: href=".../<post_id>"><time datetime="...">
         dt_pattern = re.escape(post_url) + r'"[^>]*>\s*<time[^>]+datetime="([^"]+)"'
         dt_m = re.search(dt_pattern, html)
         if not dt_m:
-            # fallback: любой datetime поблизости
             idx = html.find(post_url)
             snippet = html[max(0, idx-50):idx+300]
             dt_m2 = re.search(r'datetime="([^"]+)"', snippet)
@@ -112,24 +88,21 @@ def _scrape(html: str, username: str) -> list[Post]:
         else:
             post_date = _parse_dt(dt_m.group(1))
 
-        # Текст поста: блок tgme_widget_message_text перед этой ссылкой
         idx = html.find(post_url)
         if idx == -1:
             continue
-        # Берём HTML от начала поста (data-post="channel/ID") до ссылки с датой
         start_marker = f'data-post="{username}/{post_id}"'
         start_idx = html.rfind(start_marker, 0, idx)
         if start_idx == -1:
             continue
         block = html[start_idx:idx]
 
-        # Ищем текст внутри tgme_widget_message_text
         text_m = re.search(
             r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
             block, re.S | re.I
         )
         if not text_m:
-            continue  # пост без текста (только медиа)
+            continue
 
         text = _strip_tags(text_m.group(1))
         if not text:
@@ -191,7 +164,7 @@ async def fetch_all_user_channels(
     channels: list[str],
     limit_per_channel: int = None,
     since_hours: int = None,
-    client=None,  # совместимость, игнорируется
+    client=None,
 ) -> list[Post]:
     limit = limit_per_channel or settings.POSTS_PER_CHANNEL
     all_posts: list[Post] = []
@@ -207,9 +180,9 @@ async def fetch_all_user_channels(
     return all_posts
 
 
-# ── Заглушки Telethon (совместимость) ────────────────────────────
 async def get_telethon_client():
     return _DummyClient()
+
 
 class _DummyClient:
     async def disconnect(self): pass
