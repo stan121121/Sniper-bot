@@ -1,27 +1,22 @@
 """
-summarizer.py — OpenRouter: фильтрация + веб-новости + итог дня
-Мягкая обработка ошибок API (402, 429, 500 и т.д.)
+summarizer.py — DeepSeek API (OpenAI-совместимый) для фильтрации,
+генерации веб-новостей и итога дня.
 """
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-import httpx
+from openai import AsyncOpenAI
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-
-def _auth_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/newsdigestbot",
-        "X-Title": "News Digest Bot",
-    }
+# DeepSeek OpenAI-совместимый клиент
+_client = AsyncOpenAI(
+    api_key=settings.DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
+)
 
 
 @dataclass
@@ -34,49 +29,46 @@ class DigestItem:
     source_type: str = "telegram"   # "telegram" | "web"
 
 
-# ── OpenRouter helper ─────────────────────────────────────────────
-
-class OpenRouterError(Exception):
-    def __init__(self, status: int, msg: str):
-        self.status = status
-        super().__init__(f"HTTP {status}: {msg}")
+# ── Обработка ошибок ─────────────────────────────────────────────
 
 _ERROR_HINTS = {
-    402: "❌ Нет баланса на OpenRouter. Пополни счёт: https://openrouter.ai/credits",
-    401: "❌ Неверный OPENROUTER_API_KEY.",
-    429: "⚠️ Превышен лимит запросов OpenRouter. Попробуй позже.",
-    503: "⚠️ OpenRouter временно недоступен.",
+    402: "❌ Нет баланса на DeepSeek. Пополни счёт: https://platform.deepseek.com/top_up",
+    401: "❌ Неверный DEEPSEEK_API_KEY.",
+    429: "⚠️ Превышен лимит запросов DeepSeek. Попробуй позже.",
+    503: "⚠️ DeepSeek временно недоступен.",
 }
 
-async def _openrouter(system: str, user: str, max_tokens: int = 2000) -> str:
-    """
-    Вызов OpenRouter API.
-    Бросает OpenRouterError с понятным сообщением при ошибках.
-    """
-    payload = {
-        "model": settings.OPENROUTER_MODEL,
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-    }
-    async with httpx.AsyncClient(timeout=60.0) as http:
-        resp = await http.post(OPENROUTER_URL, json=payload, headers=_auth_headers())
 
-    if not resp.is_success:
-        hint = _ERROR_HINTS.get(resp.status_code, f"HTTP {resp.status_code}")
-        logger.error("OpenRouter %d: %s", resp.status_code, resp.text[:200])
-        raise OpenRouterError(resp.status_code, hint)
+async def _deepseek(system: str, user: str, max_tokens: int = 2000) -> str:
+    """
+    Вызов DeepSeek Chat Completions.
+    Бросает исключение с понятным сообщением при ошибках.
+    """
+    try:
+        response = await _client.chat.completions.create(
+            model=settings.DEEPSEEK_MODEL,
+            max_tokens=max_tokens,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        # Очистка от markdown-бэктиков
+        if "```" in raw:
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return raw.strip()
 
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    if "```" in raw:
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else parts[0]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return raw.strip()
+    except Exception as e:
+        status = getattr(e, "status_code", None) or getattr(e, "http_status", None)
+        if status and status in _ERROR_HINTS:
+            raise RuntimeError(_ERROR_HINTS[status]) from e
+        logger.error("DeepSeek error: %s", e)
+        raise RuntimeError(f"⚠️ Ошибка DeepSeek API: {e}") from e
 
 
 def _fmt_posts(posts) -> str:
@@ -96,6 +88,11 @@ def _fmt_posts(posts) -> str:
 async def summarize_posts(posts) -> list[DigestItem]:
     if not posts:
         return []
+
+    # Ограничиваем количество постов, передаваемых в AI
+    posts = sorted(posts, key=lambda p: p.date, reverse=True)
+    posts = posts[: settings.MAX_POSTS_TO_AI]
+
     system = (
         "Ты редактор новостного дайджеста. Из потока постов выбери ТОЛЬКО важные, "
         "отфильтровав рекламу, репосты без ценности, мелкие события, дубли.\n"
@@ -107,12 +104,12 @@ async def summarize_posts(posts) -> list[DigestItem]:
         f"Посты:\n{_fmt_posts(posts)}\n\nJSON: [{{...}}, ...]"
     )
     try:
-        raw = await _openrouter(system, user)
+        raw = await _deepseek(system, user)
         items = [
             DigestItem(
-                title=d.get("title",""), summary=d.get("summary",""),
-                importance=int(d.get("importance",5)),
-                channel=d.get("channel",""), url=d.get("url",""),
+                title=d.get("title", ""), summary=d.get("summary", ""),
+                importance=int(d.get("importance", 5)),
+                channel=d.get("channel", ""), url=d.get("url", ""),
                 source_type="telegram",
             )
             for d in json.loads(raw) if isinstance(d, dict)
@@ -120,7 +117,7 @@ async def summarize_posts(posts) -> list[DigestItem]:
         items.sort(key=lambda x: x.importance, reverse=True)
         logger.info("TG digest: %d items", len(items))
         return items
-    except OpenRouterError as e:
+    except RuntimeError as e:
         logger.error("summarize_posts: %s", e)
         return []
     except Exception as e:
@@ -128,12 +125,12 @@ async def summarize_posts(posts) -> list[DigestItem]:
         return []
 
 
-# ── 2. Веб-новости (AI генерирует из своих знаний) ───────────────
+# ── 2. Веб-новости ───────────────────────────────────────────────
 
 async def fetch_web_news(topic: str = "главные новости дня", lang: str = "ru") -> tuple[list[DigestItem], Optional[str]]:
     """
     Возвращает (items, error_msg).
-    error_msg != None если API недоступен — бот отправит пользователю подсказку.
+    error_msg != None если API недоступен.
     """
     lang_str = "русский" if lang == "ru" else "english"
     system = (
@@ -149,12 +146,12 @@ async def fetch_web_news(topic: str = "главные новости дня", la
         "JSON: [{...}, ...]"
     )
     try:
-        raw = await _openrouter(system, user)
+        raw = await _deepseek(system, user)
         items = [
             DigestItem(
-                title=d.get("title",""), summary=d.get("summary",""),
-                importance=int(d.get("importance",5)),
-                channel=d.get("source","Web"), url=d.get("url",""),
+                title=d.get("title", ""), summary=d.get("summary", ""),
+                importance=int(d.get("importance", 5)),
+                channel=d.get("source", "Web"), url=d.get("url", ""),
                 source_type="web",
             )
             for d in json.loads(raw) if isinstance(d, dict)
@@ -162,8 +159,8 @@ async def fetch_web_news(topic: str = "главные новости дня", la
         items.sort(key=lambda x: x.importance, reverse=True)
         logger.info("Web news: %d items", len(items))
         return items, None
-    except OpenRouterError as e:
-        hint = str(e).split(": ", 1)[-1]   # берём текст после "HTTP NNN: "
+    except RuntimeError as e:
+        hint = str(e)
         logger.error("fetch_web_news: %s", e)
         return [], hint
     except Exception as e:
@@ -181,14 +178,14 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
     )
     lang_str = "русский" if lang == "ru" else "english"
     try:
-        summary = await _openrouter(
+        summary = await _deepseek(
             f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений: что главное произошло, "
             f"тренды, на что обратить внимание. Язык: {lang_str}. Стиль: деловой.",
             f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:",
             max_tokens=400,
         )
         return summary.strip()
-    except OpenRouterError as e:
+    except RuntimeError as e:
         logger.warning("day_summary skipped: %s", e)
         return ""
     except Exception as e:
@@ -199,14 +196,16 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
 # ── 4. Форматирование ─────────────────────────────────────────────
 
 def _he(t: str) -> str:
-    return t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-_IMP_EMOJI = {10:"🔴",9:"🔴",8:"🟠",7:"🟠",6:"🟡",5:"🟡"}
+
+_IMP_EMOJI = {10: "🔴", 9: "🔴", 8: "🟠", 7: "🟠", 6: "🟡", 5: "🟡"}
+
 
 def _item_html(item: DigestItem) -> str:
     emoji = _IMP_EMOJI.get(item.importance, "🟢")
-    icon  = "🌐" if item.source_type == "web" else "📣"
-    link  = f' | <a href="{item.url}">Читать →</a>' if item.url else ""
+    icon = "🌐" if item.source_type == "web" else "📣"
+    link = f' | <a href="{item.url}">Читать →</a>' if item.url else ""
     return (
         f'{emoji} <b>{_he(item.title)}</b>\n'
         f'{_he(item.summary)}\n'
@@ -239,11 +238,10 @@ def format_digest_message(
     if day_summary:
         parts.append(f"\n\n📊 <b>Итог дня</b>\n<i>{_he(day_summary)}</i>")
 
-    # Показываем ошибку API как предупреждение (не крашим дайджест)
     if api_error:
         parts.append(f"\n\n⚠️ <i>{_he(api_error)}</i>")
 
-    model_short = settings.OPENROUTER_MODEL.split("/")[-1]
-    parts.append(f"\n🤖 <i>{_he(model_short)}</i>")
+    model_short = settings.DEEPSEEK_MODEL.replace("deepseek-", "")
+    parts.append(f"\n🤖 <i>DeepSeek {model_short}</i>")
 
     return "\n".join(parts)
