@@ -1,8 +1,12 @@
 """
-main.py — запуск бота + планировщик (каждую минуту проверяем расписание)
+main.py — запуск бота + планировщик.
+С логированием в файл (для Railway).
 """
 import asyncio
 import logging
+import logging.handlers
+import os
+
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,11 +16,20 @@ from database import Database
 from handlers import router
 from scheduler import tick, run_digest
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# ── Логирование ──────────────────────────────────────────────────
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+# Дополнительно пишем в файл (Railway сохраняет logs/)
+if os.path.isdir("/app/logs"):
+    file_handler = logging.handlers.RotatingFileHandler(
+        "/app/logs/bot.log", maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(file_handler)
 
 
 async def main():
@@ -33,13 +46,13 @@ async def main():
     scheduler.add_job(tick, "cron", minute="*",
                       args=[bot, db], id="tick")
 
-    # Резервный интервальный дайджест для тех, у кого нет расписания
+    # Резервный интервальный дайджест
     scheduler.add_job(run_digest, "interval",
                       hours=settings.DEFAULT_DIGEST_INTERVAL_HOURS,
                       args=[bot, db], id="interval_digest")
 
     scheduler.start()
-    logger.info("Bot started.")
+    logger.info("Bot started. Model: %s", settings.DEEPSEEK_MODEL)
 
     try:
         await dp.start_polling(bot, db=db, scheduler=scheduler)
