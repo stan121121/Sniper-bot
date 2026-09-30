@@ -8,9 +8,9 @@ class Settings(BaseSettings):
     # Google Gemini
     GEMINI_API_KEY: str
     GEMINI_MODEL: str = "gemini-3.8-flash"
-    GEMINI_FALLBACK_MODEL: str = "gemini-3.1-flash-lite"   # ← fallback
-    GEMINI_MAX_RETRIES: int = 5                             # ← количество попыток
-    GEMINI_RETRY_DELAY: float = 2.0                         # ← начальная задержка
+    GEMINI_FALLBACK_MODEL: str = "gemini-3.1-flash-lite"
+    GEMINI_MAX_RETRIES: int = 5
+    GEMINI_RETRY_DELAY: float = 2.0
 
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
@@ -20,8 +20,9 @@ class Settings(BaseSettings):
     DIGEST_LANGUAGE: str = "ru"
     DB_PATH: str = "bot_data.db"
 
-    # Веб-новости
-    INCLUDE_WEB_NEWS: bool = True
+    # Веб-новости — по умолчанию ОТКЛЮЧЕНЫ.
+    # Бот работает только с постами из каналов пользователя.
+    INCLUDE_WEB_NEWS: bool = False
     WEB_NEWS_TOPIC: str = "главные мировые и российские новости дня"
 
     class Config:
