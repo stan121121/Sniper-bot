@@ -52,7 +52,7 @@ async def main():
                       args=[bot, db], id="interval_digest")
 
     scheduler.start()
-    logger.info("Bot started. Model: %s", settings.DEEPSEEK_MODEL)
+    logger.info("Bot started. Model: %s", settings.GEMINI_MODEL)
 
     try:
         await dp.start_polling(bot, db=db, scheduler=scheduler)
