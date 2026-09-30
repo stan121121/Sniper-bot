@@ -1,5 +1,5 @@
 """
-summarizer.py — DeepSeek API (OpenAI-совместимый) для фильтрации,
+summarizer.py — Google Gemini API (google-genai SDK) для фильтрации,
 генерации веб-новостей и итога дня.
 """
 import json
@@ -7,16 +7,14 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# DeepSeek OpenAI-совместимый клиент
-_client = AsyncOpenAI(
-    api_key=settings.DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com",
-)
+# Gemini клиент (единый на весь модуль)
+_client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
 @dataclass
@@ -32,29 +30,28 @@ class DigestItem:
 # ── Обработка ошибок ─────────────────────────────────────────────
 
 _ERROR_HINTS = {
-    402: "❌ Нет баланса на DeepSeek. Пополни счёт: https://platform.deepseek.com/top_up",
-    401: "❌ Неверный DEEPSEEK_API_KEY.",
-    429: "⚠️ Превышен лимит запросов DeepSeek. Попробуй позже.",
-    503: "⚠️ DeepSeek временно недоступен.",
+    429: "⚠️ Превышен лимит запросов Gemini. Попробуй позже (бесплатный тариф: ~15 запросов/мин).",
+    403: "❌ Неверный GEMINI_API_KEY или API не включён. Проверь ключ: https://aistudio.google.com/app/apikey",
+    400: "❌ Ошибка в запросе к Gemini. Возможно, превышен размер контекста.",
 }
 
 
-async def _deepseek(system: str, user: str, max_tokens: int = 2000) -> str:
+async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     """
-    Вызов DeepSeek Chat Completions.
-    Бросает исключение с понятным сообщением при ошибках.
+    Вызов Gemini API через google-genai SDK.
+    Бросает RuntimeError с понятным сообщением при ошибках.
     """
     try:
-        response = await _client.chat.completions.create(
-            model=settings.DEEPSEEK_MODEL,
-            max_tokens=max_tokens,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+        response = await _client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.3,
+                max_output_tokens=max_tokens,
+            ),
         )
-        raw = response.choices[0].message.content.strip()
+        raw = response.text.strip()
         # Очистка от markdown-бэктиков
         if "```" in raw:
             parts = raw.split("```")
@@ -64,11 +61,12 @@ async def _deepseek(system: str, user: str, max_tokens: int = 2000) -> str:
         return raw.strip()
 
     except Exception as e:
-        status = getattr(e, "status_code", None) or getattr(e, "http_status", None)
+        # Пытаемся определить HTTP-статус из разных типов исключений
+        status = getattr(e, "status_code", None) or getattr(e, "code", None)
         if status and status in _ERROR_HINTS:
             raise RuntimeError(_ERROR_HINTS[status]) from e
-        logger.error("DeepSeek error: %s", e)
-        raise RuntimeError(f"⚠️ Ошибка DeepSeek API: {e}") from e
+        logger.error("Gemini error: %s", e)
+        raise RuntimeError(f"⚠️ Ошибка Gemini API: {e}") from e
 
 
 def _fmt_posts(posts) -> str:
@@ -85,9 +83,10 @@ def _fmt_posts(posts) -> str:
 
 # ── 1. Фильтрация Telegram-постов ────────────────────────────────
 
-async def summarize_posts(posts) -> list[DigestItem]:
+async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
+    """Возвращает (items, error). error != None при сбое API."""
     if not posts:
-        return []
+        return [], None
 
     # Ограничиваем количество постов, передаваемых в AI
     posts = sorted(posts, key=lambda p: p.date, reverse=True)
@@ -104,7 +103,7 @@ async def summarize_posts(posts) -> list[DigestItem]:
         f"Посты:\n{_fmt_posts(posts)}\n\nJSON: [{{...}}, ...]"
     )
     try:
-        raw = await _deepseek(system, user)
+        raw = await _gemini(system, user)
         items = [
             DigestItem(
                 title=d.get("title", ""), summary=d.get("summary", ""),
@@ -116,22 +115,19 @@ async def summarize_posts(posts) -> list[DigestItem]:
         ]
         items.sort(key=lambda x: x.importance, reverse=True)
         logger.info("TG digest: %d items", len(items))
-        return items
+        return items, None
     except RuntimeError as e:
         logger.error("summarize_posts: %s", e)
-        return []
+        return [], str(e)
     except Exception as e:
         logger.error("summarize_posts unexpected: %s", e)
-        return []
+        return [], f"⚠️ Ошибка: {e}"
 
 
 # ── 2. Веб-новости ───────────────────────────────────────────────
 
 async def fetch_web_news(topic: str = "главные новости дня", lang: str = "ru") -> tuple[list[DigestItem], Optional[str]]:
-    """
-    Возвращает (items, error_msg).
-    error_msg != None если API недоступен.
-    """
+    """Возвращает (items, error_msg)."""
     lang_str = "русский" if lang == "ru" else "english"
     system = (
         "Ты редактор новостного дайджеста. Составь список важных новостей "
@@ -146,7 +142,7 @@ async def fetch_web_news(topic: str = "главные новости дня", la
         "JSON: [{...}, ...]"
     )
     try:
-        raw = await _deepseek(system, user)
+        raw = await _gemini(system, user)
         items = [
             DigestItem(
                 title=d.get("title", ""), summary=d.get("summary", ""),
@@ -160,9 +156,8 @@ async def fetch_web_news(topic: str = "главные новости дня", la
         logger.info("Web news: %d items", len(items))
         return items, None
     except RuntimeError as e:
-        hint = str(e)
         logger.error("fetch_web_news: %s", e)
-        return [], hint
+        return [], str(e)
     except Exception as e:
         logger.error("fetch_web_news unexpected: %s", e)
         return [], None
@@ -178,7 +173,7 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
     )
     lang_str = "русский" if lang == "ru" else "english"
     try:
-        summary = await _deepseek(
+        summary = await _gemini(
             f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений: что главное произошло, "
             f"тренды, на что обратить внимание. Язык: {lang_str}. Стиль: деловой.",
             f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:",
@@ -241,7 +236,7 @@ def format_digest_message(
     if api_error:
         parts.append(f"\n\n⚠️ <i>{_he(api_error)}</i>")
 
-    model_short = settings.DEEPSEEK_MODEL.replace("deepseek-", "")
-    parts.append(f"\n🤖 <i>DeepSeek {model_short}</i>")
+    model_short = settings.GEMINI_MODEL.replace("gemini-", "Gemini ")
+    parts.append(f"\n🤖 <i>{_he(model_short)}</i>")
 
     return "\n".join(parts)
