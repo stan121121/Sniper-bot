@@ -1,15 +1,18 @@
 """
-scheduler.py — тик каждую минуту + резервный интервал.
+scheduler.py — тик каждую минуту.
 
 Изменения:
-  - Веб-новости НЕ вызываются: бот работает только с каналами пользователя.
+  - Расписание пользователя хранится в МСК (Europe/Moscow).
+  - tick() вычисляет ТЕКУЩЕЕ время в этом часовом поясе и сравнивает
+    с сохранёнными hour/minute.
+  - Веб-новости не вызываются: бот работает только с каналами.
   - summarize_posts возвращает (items, error); посты помечаются seen
     только при успешном ответе AI.
-  - Задержка между пользователями, чтобы не превышать лимиты Gemini.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
@@ -25,14 +28,18 @@ from summarizer import (
 
 logger = logging.getLogger(__name__)
 
+# Часовой пояс из настроек (по умолчанию Europe/Moscow)
+_TZ = ZoneInfo(settings.TIMEZONE)
+
 
 async def tick(bot: Bot, db: Database):
-    """Каждую минуту: проверяем у кого сейчас время дайджеста."""
-    now = datetime.now(timezone.utc)
+    """Каждую минуту: проверяем у кого сейчас время дайджеста (по МСК)."""
+    now = datetime.now(_TZ)
     user_ids = await db.get_users_for_time(now.hour, now.minute)
     if not user_ids:
         return
-    logger.info("Tick %02d:%02d — %d users", now.hour, now.minute, len(user_ids))
+    logger.info("Tick %02d:%02d (%s) — %d users",
+                now.hour, now.minute, settings.TIMEZONE, len(user_ids))
 
     for i, uid in enumerate(user_ids):
         channels = await db.get_user_channels(uid)
@@ -92,7 +99,7 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
                     "User %d: posts NOT marked seen due to AI error", user_id
                 )
 
-    # 2. Веб-новости ОТКЛЮЧЕНЫ — бот работает только с каналами пользователя.
+    # 2. Веб-новости ОТКЛЮЧЕНЫ.
     web_items = []
     all_items = tg_items
     api_error = tg_error
