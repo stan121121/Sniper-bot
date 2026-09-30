@@ -1,6 +1,12 @@
 """
-summarizer.py — Google Gemini API (google-genai SDK) для фильтрации,
-генерации веб-новостей и итога дня.
+summarizer.py — Google Gemini через Interactions API (google-genai SDK).
+Модель по умолчанию: gemini-3.8-flash.
+
+Изменения по сравнению с предыдущей версией:
+  - Переход с generate_content() на Interactions API (client.aio.interactions.create)
+  - Модель обновлена до gemini-3.8-flash
+  - summarize_posts и fetch_web_news возвращают (items, error)
+  - Корректная обработка system_instruction и generation_config
 """
 import json
 import logging
@@ -8,12 +14,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from google import genai
-from google.genai import types
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Gemini клиент (единый на весь модуль)
+# Gemini-клиент (единый на весь модуль)
 _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
@@ -33,35 +38,38 @@ _ERROR_HINTS = {
     429: "⚠️ Превышен лимит запросов Gemini. Попробуй позже (бесплатный тариф: ~15 запросов/мин).",
     403: "❌ Неверный GEMINI_API_KEY или API не включён. Проверь ключ: https://aistudio.google.com/app/apikey",
     400: "❌ Ошибка в запросе к Gemini. Возможно, превышен размер контекста.",
+    404: "❌ Модель не найдена. Проверь GEMINI_MODEL (актуальная: gemini-3.8-flash).",
 }
 
 
 async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     """
-    Вызов Gemini API через google-genai SDK.
+    Вызов Gemini через Interactions API.
     Бросает RuntimeError с понятным сообщением при ошибках.
     """
     try:
-        response = await _client.aio.models.generate_content(
+        interaction = await _client.aio.interactions.create(
             model=settings.GEMINI_MODEL,
-            contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.3,
-                max_output_tokens=max_tokens,
-            ),
+            input=user,
+            system_instruction=system,
+            generation_config={
+                "temperature": 0.3,
+                "max_output_tokens": max_tokens,
+            },
         )
-        raw = response.text.strip()
+
+        raw = interaction.output_text.strip()
+
         # Очистка от markdown-бэктиков
         if "```" in raw:
             parts = raw.split("```")
             raw = parts[1] if len(parts) > 1 else parts[0]
             if raw.startswith("json"):
                 raw = raw[4:]
+
         return raw.strip()
 
     except Exception as e:
-        # Пытаемся определить HTTP-статус из разных типов исключений
         status = getattr(e, "status_code", None) or getattr(e, "code", None)
         if status and status in _ERROR_HINTS:
             raise RuntimeError(_ERROR_HINTS[status]) from e
@@ -75,7 +83,7 @@ def _fmt_posts(posts) -> str:
         date_str = p.date.strftime("%d.%m %H:%M")
         lines.append(
             f"[{i}] {p.channel_title} (@{p.channel}) | {date_str}\n"
-            f"    {p.text[:400].replace(chr(10),' ')}\n"
+            f"    {p.text[:400].replace(chr(10), ' ')}\n"
             f"    {p.url}"
         )
     return "\n\n".join(lines)
@@ -84,7 +92,11 @@ def _fmt_posts(posts) -> str:
 # ── 1. Фильтрация Telegram-постов ────────────────────────────────
 
 async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
-    """Возвращает (items, error). error != None при сбое API."""
+    """
+    Возвращает (items, error).
+    error != None при сбое API — тогда items пустой, и scheduler НЕ помечает
+    посты как seen, чтобы повторить попытку при следующем запуске.
+    """
     if not posts:
         return [], None
 
@@ -102,20 +114,25 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
         'Для каждой: "title"(80 симв.), "summary"(2-3 предл.), "importance"(1-10), "channel", "url"\n\n'
         f"Посты:\n{_fmt_posts(posts)}\n\nJSON: [{{...}}, ...]"
     )
+
     try:
         raw = await _gemini(system, user)
         items = [
             DigestItem(
-                title=d.get("title", ""), summary=d.get("summary", ""),
+                title=d.get("title", ""),
+                summary=d.get("summary", ""),
                 importance=int(d.get("importance", 5)),
-                channel=d.get("channel", ""), url=d.get("url", ""),
+                channel=d.get("channel", ""),
+                url=d.get("url", ""),
                 source_type="telegram",
             )
-            for d in json.loads(raw) if isinstance(d, dict)
+            for d in json.loads(raw)
+            if isinstance(d, dict)
         ]
         items.sort(key=lambda x: x.importance, reverse=True)
         logger.info("TG digest: %d items", len(items))
         return items, None
+
     except RuntimeError as e:
         logger.error("summarize_posts: %s", e)
         return [], str(e)
@@ -126,8 +143,14 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
 
 # ── 2. Веб-новости ───────────────────────────────────────────────
 
-async def fetch_web_news(topic: str = "главные новости дня", lang: str = "ru") -> tuple[list[DigestItem], Optional[str]]:
-    """Возвращает (items, error_msg)."""
+async def fetch_web_news(
+    topic: str = "главные новости дня",
+    lang: str = "ru",
+) -> tuple[list[DigestItem], Optional[str]]:
+    """
+    Возвращает (items, error).
+    error != None, если API недоступен — бот отправит пользователю подсказку.
+    """
     lang_str = "русский" if lang == "ru" else "english"
     system = (
         "Ты редактор новостного дайджеста. Составь список важных новостей "
@@ -141,20 +164,25 @@ async def fetch_web_news(topic: str = "главные новости дня", la
         '"source"(название СМИ), "url"(если знаешь, иначе "")\n\n'
         "JSON: [{...}, ...]"
     )
+
     try:
         raw = await _gemini(system, user)
         items = [
             DigestItem(
-                title=d.get("title", ""), summary=d.get("summary", ""),
+                title=d.get("title", ""),
+                summary=d.get("summary", ""),
                 importance=int(d.get("importance", 5)),
-                channel=d.get("source", "Web"), url=d.get("url", ""),
+                channel=d.get("source", "Web"),
+                url=d.get("url", ""),
                 source_type="web",
             )
-            for d in json.loads(raw) if isinstance(d, dict)
+            for d in json.loads(raw)
+            if isinstance(d, dict)
         ]
         items.sort(key=lambda x: x.importance, reverse=True)
         logger.info("Web news: %d items", len(items))
         return items, None
+
     except RuntimeError as e:
         logger.error("fetch_web_news: %s", e)
         return [], str(e)
@@ -168,10 +196,12 @@ async def fetch_web_news(topic: str = "главные новости дня", la
 async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str:
     if not items:
         return ""
+
     digest_text = "\n".join(
         f"• [{i.importance}/10] {i.title} — {i.summary}" for i in items
     )
     lang_str = "русский" if lang == "ru" else "english"
+
     try:
         summary = await _gemini(
             f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений: что главное произошло, "
@@ -180,6 +210,7 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
             max_tokens=400,
         )
         return summary.strip()
+
     except RuntimeError as e:
         logger.warning("day_summary skipped: %s", e)
         return ""
