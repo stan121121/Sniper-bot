@@ -5,15 +5,15 @@ class Settings(BaseSettings):
     # Telegram
     BOT_TOKEN: str
 
-    # DeepSeek
-    DEEPSEEK_API_KEY: str
-    DEEPSEEK_MODEL: str = "deepseek-flash"
+    # Google Gemini
+    GEMINI_API_KEY: str
+    GEMINI_MODEL: str = "gemini-2.5-flash"
 
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
     POSTS_PER_CHANNEL: int = 20
     MAX_NEWS_IN_DIGEST: int = 10
-    MAX_POSTS_TO_AI: int = 50          # ← ограничение постов для AI
+    MAX_POSTS_TO_AI: int = 50
     DIGEST_LANGUAGE: str = "ru"
     DB_PATH: str = "bot_data.db"
 
