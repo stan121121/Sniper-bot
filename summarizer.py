@@ -1,13 +1,12 @@
 """
 summarizer.py — Google Gemini через Interactions API (google-genai SDK).
-Модель по умолчанию: gemini-3.8-flash.
-Fallback: gemini-3.1-flash-lite при перегрузке.
 
-Изменения:
-  - Добавлен retry с экспоненциальной задержкой
-  - Добавлен fallback на более лёгкую модель
-  - Обработка 503 UNAVAILABLE
-  - summarize_posts и fetch_web_news возвращают (items, error)
+Ключевые принципы:
+  - Модель работает СТРОГО с постами из каналов пользователя.
+  - НЕ использует свои знания о мире, НЕ ищет новости в интернете,
+    НЕ добавляет факты, которых нет в постах.
+  - Retry с экспоненциальной задержкой и fallback на резервную модель.
+  - summarize_posts и fetch_web_news возвращают (items, error).
 """
 import asyncio
 import json
@@ -31,7 +30,7 @@ class DigestItem:
     importance: int
     channel: str
     url: str
-    source_type: str = "telegram"
+    source_type: str = "telegram"   # "telegram" | "web"
 
 
 # ── Обработка ошибок ─────────────────────────────────────────────
@@ -44,7 +43,6 @@ _ERROR_HINTS = {
     503: "⚠️ Gemini временно перегружен. Повторяю запрос...",
 }
 
-# Коды, при которых стоит повторить запрос
 _RETRYABLE_STATUS = {429, 503, 500, 502, 504}
 
 
@@ -71,9 +69,8 @@ async def _gemini_call(model: str, system: str, user: str, max_tokens: int) -> s
 async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     """
     Вызов Gemini с retry и fallback.
-    Сначала пробует основную модель GEMINI_MODEL.
-    При 503 — экспоненциальная задержка и повтор.
-    После исчерпания попыток — fallback на GEMINI_FALLBACK_MODEL.
+    Сначала пробует GEMINI_MODEL, при 503/429 — экспоненциальная задержка,
+    затем fallback на GEMINI_FALLBACK_MODEL.
     """
     models = [settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL]
     last_error = None
@@ -93,16 +90,14 @@ async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
                 status = getattr(e, "status_code", None) or getattr(e, "code", None)
                 last_error = e
 
-                # Не retryable ошибки — сразу пробуем fallback
                 if status and status not in _RETRYABLE_STATUS:
                     hint = _ERROR_HINTS.get(status, f"HTTP {status}")
                     logger.error("Non-retryable error %s: %s", status, hint)
-                    break  # переходим к следующей модели
+                    break
 
-                # Retryable ошибка — ждём и повторяем
                 if attempt < settings.GEMINI_MAX_RETRIES - 1:
                     delay = settings.GEMINI_RETRY_DELAY * (2 ** attempt)
-                    delay += random.uniform(0, 1)  # jitter
+                    delay += random.uniform(0, 1)
                     logger.warning(
                         "Gemini %s error (attempt %d/%d), retrying in %.1fs: %s",
                         status, attempt + 1, settings.GEMINI_MAX_RETRIES, delay, e
@@ -114,7 +109,6 @@ async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
                         model, settings.GEMINI_MAX_RETRIES, e
                     )
 
-    # Все модели и попытки исчерпаны
     status = getattr(last_error, "status_code", None) or getattr(last_error, "code", None)
     if status and status in _ERROR_HINTS:
         raise RuntimeError(_ERROR_HINTS[status]) from last_error
@@ -133,9 +127,14 @@ def _fmt_posts(posts) -> str:
     return "\n\n".join(lines)
 
 
-# ── 1. Фильтрация Telegram-постов ────────────────────────────────
+# ── 1. Фильтрация Telegram-постов (только каналы пользователя) ───
 
 async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
+    """
+    Отбирает важные посты ТОЛЬКО из переданного списка.
+    Модель не должна добавлять факты из своих знаний или интернета.
+    Возвращает (items, error).
+    """
     if not posts:
         return [], None
 
@@ -143,14 +142,35 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
     posts = posts[: settings.MAX_POSTS_TO_AI]
 
     system = (
-        "Ты редактор новостного дайджеста. Из потока постов выбери ТОЛЬКО важные, "
-        "отфильтровав рекламу, репосты без ценности, мелкие события, дубли.\n"
-        "СТРОГО JSON-массив. Без пояснений, без markdown-бэктиков."
+        "Ты редактор новостного дайджеста. Твоя задача — отобрать важные посты "
+        "ИЗ ПРЕДОСТАВЛЕННОГО СПИСКА и сжать их до короткого резюме.\n\n"
+        "ЖЁСТКИЕ ПРАВИЛА:\n"
+        "1. Используй ТОЛЬКО информацию из текстов ниже. НЕ добавляй факты, "
+        "   имена, числа или события, которых нет в постах.\n"
+        "2. НЕ используй свои знания о мире, НЕ ищи новости в интернете, "
+        "   НЕ ссылайся на другие источники.\n"
+        "3. Если в посте не хватает данных — не додумывай, просто опиши то, "
+        "   что есть в посте.\n"
+        "4. Отфильтруй рекламу, репосты без добавленной ценности, мелкие "
+        "   события, дубли.\n"
+        "5. Поле \"url\" бери строго из соответствующего поста. Если ссылки нет — "
+        "   оставь пустую строку.\n\n"
+        "ФОРМАТ ОТВЕТА: СТРОГО JSON-массив. Без пояснений, без markdown-бэктиков."
     )
     user = (
-        f"Вот {len(posts)} постов. Выбери не более {settings.MAX_NEWS_IN_DIGEST} важных.\n"
-        'Для каждой: "title"(80 симв.), "summary"(2-3 предл.), "importance"(1-10), "channel", "url"\n\n'
-        f"Посты:\n{_fmt_posts(posts)}\n\nJSON: [{{...}}, ...]"
+        f"Ниже {len(posts)} постов из Telegram-каналов пользователя. "
+        f"Выбери не более {settings.MAX_NEWS_IN_DIGEST} самых важных.\n\n"
+        "Для каждой новости укажи:\n"
+        '  "title" — до 80 символов, на основе текста поста\n'
+        '  "summary" — 2-3 предложения, строго из содержания поста\n'
+        '  "importance" — целое 1-10 (насколько важна эта новость)\n'
+        '  "channel" — @username канала из заголовка поста\n'
+        '  "url" — ссылка на пост (скопируй из строки поста)\n\n'
+        "НЕ добавляй ничего от себя. Если новость — просто репост без "
+        "добавленной ценности, пропусти её.\n\n"
+        f"Посты:\n{_fmt_posts(posts)}\n\n"
+        "Ответ — JSON-массив: [{\"title\": \"...\", \"summary\": \"...\", "
+        "\"importance\": 7, \"channel\": \"@...\", \"url\": \"...\"}, ...]"
     )
 
     try:
@@ -179,16 +199,20 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
         return [], f"⚠️ Ошибка: {e}"
 
 
-# ── 2. Веб-новости ───────────────────────────────────────────────
+# ── 2. Веб-новости (функция сохранена, но не вызывается) ─────────
 
 async def fetch_web_news(
     topic: str = "главные новости дня",
     lang: str = "ru",
 ) -> tuple[list[DigestItem], Optional[str]]:
+    """
+    Резервная функция. По умолчанию НЕ используется
+    (INCLUDE_WEB_NEWS=false). Оставлена для совместимости.
+    """
     lang_str = "русский" if lang == "ru" else "english"
     system = (
         "Ты редактор новостного дайджеста. Составь список важных новостей "
-        "на основе своих знаний. Для каждой укажи реальный источник (Reuters, BBC, РИА и т.д.).\n"
+        "на основе своих знаний. Для каждой укажи реальный источник.\n"
         "СТРОГО JSON-массив. Без пояснений, без markdown-бэктиков."
     )
     user = (
@@ -236,15 +260,16 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
     )
     lang_str = "русский" if lang == "ru" else "english"
 
-    try:
-        summary = await _gemini(
-            f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений: что главное произошло, "
-            f"тренды, на что обратить внимание. Язык: {lang_str}. Стиль: деловой.",
-            f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:",
-            max_tokens=400,
-        )
-        return summary.strip()
+    system = (
+        f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений о том, что главное "
+        f"произошло. Используй ТОЛЬКО перечисленные ниже новости, не добавляй "
+        f"факты из своих знаний. Язык: {lang_str}. Стиль: деловой."
+    )
+    user = f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:"
 
+    try:
+        summary = await _gemini(system, user, max_tokens=400)
+        return summary.strip()
     except RuntimeError as e:
         logger.warning("day_summary skipped: %s", e)
         return ""
