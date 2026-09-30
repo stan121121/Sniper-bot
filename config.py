@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     GEMINI_MAX_RETRIES: int = 5
     GEMINI_RETRY_DELAY: float = 2.0
 
+    # Часовой пояс для расписания (IANA name).
+    # Все времена в команде /schedule интерпретируются в этом поясе.
+    TIMEZONE: str = "Europe/Moscow"
+
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
     POSTS_PER_CHANNEL: int = 20
