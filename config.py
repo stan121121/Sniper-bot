@@ -7,7 +7,7 @@ class Settings(BaseSettings):
 
     # Google Gemini
     GEMINI_API_KEY: str
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"   # ← актуальная модель
 
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
