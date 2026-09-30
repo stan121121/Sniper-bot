@@ -1,7 +1,11 @@
 """
 scheduler.py — тик каждую минуту + резервный интервал.
-Обновлено: summarize_posts теперь возвращает (items, error),
-посты помечаются seen только при успешном ответе AI.
+
+Изменения:
+  - Веб-новости НЕ вызываются: бот работает только с каналами пользователя.
+  - summarize_posts возвращает (items, error); посты помечаются seen
+    только при успешном ответе AI.
+  - Задержка между пользователями, чтобы не превышать лимиты Gemini.
 """
 import asyncio
 import logging
@@ -14,14 +18,16 @@ from channel_reader import fetch_all_user_channels
 from config import settings
 from database import Database
 from summarizer import (
-    summarize_posts, fetch_web_news,
-    generate_day_summary, format_digest_message,
+    summarize_posts,
+    generate_day_summary,
+    format_digest_message,
 )
 
 logger = logging.getLogger(__name__)
 
 
 async def tick(bot: Bot, db: Database):
+    """Каждую минуту: проверяем у кого сейчас время дайджеста."""
     now = datetime.now(timezone.utc)
     user_ids = await db.get_users_for_time(now.hour, now.minute)
     if not user_ids:
@@ -43,6 +49,7 @@ async def tick(bot: Bot, db: Database):
 
 
 async def run_digest(bot: Bot, db: Database):
+    """Резервный запуск для пользователей без расписания."""
     users = await db.get_all_active_users()
     for i, user in enumerate(users):
         uid = user["user_id"]
@@ -77,25 +84,18 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
 
         if new_posts:
             tg_items, tg_error = await summarize_posts(new_posts)
-            # Помечаем seen ТОЛЬКО если AI вернул непустой результат без ошибки
             if tg_items and not tg_error:
                 for post in new_posts:
                     await db.mark_seen(user_id, post.channel, [post.id])
             elif tg_error:
-                logger.warning("User %d: posts NOT marked seen due to AI error", user_id)
+                logger.warning(
+                    "User %d: posts NOT marked seen due to AI error", user_id
+                )
 
-    # 2. Веб-новости
+    # 2. Веб-новости ОТКЛЮЧЕНЫ — бот работает только с каналами пользователя.
     web_items = []
-    web_error = None
-    if settings.INCLUDE_WEB_NEWS:
-        web_items, web_error = await fetch_web_news(
-            topic=settings.WEB_NEWS_TOPIC,
-            lang=settings.DIGEST_LANGUAGE,
-        )
-
-    all_items = tg_items + web_items
-    # Приоритет ошибки: сначала TG, потом web
-    api_error = tg_error or web_error
+    all_items = tg_items
+    api_error = tg_error
 
     if not all_items and not api_error:
         logger.info("User %d: nothing to send.", user_id)
@@ -104,7 +104,9 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
     # 3. Итог дня
     day_summary = ""
     if all_items:
-        day_summary = await generate_day_summary(all_items, lang=settings.DIGEST_LANGUAGE)
+        day_summary = await generate_day_summary(
+            all_items, lang=settings.DIGEST_LANGUAGE
+        )
 
     # 4. Отправка
     msg = format_digest_message(
@@ -136,11 +138,12 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
             )
 
     await db.log_digest(user_id, len(all_items), day_summary)
-    logger.info("User %d: sent %d items (tg=%d web=%d).",
-                user_id, len(all_items), len(tg_items), len(web_items))
+    logger.info("User %d: sent %d items (tg=%d).",
+                user_id, len(all_items), len(tg_items))
 
 
 def _split_message(text: str, limit: int = 4000) -> list[str]:
+    """Разбить длинное сообщение на части по границам абзацев."""
     if len(text) <= limit:
         return [text]
     parts, buf = [], ""
