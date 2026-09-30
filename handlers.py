@@ -1,6 +1,9 @@
 """
 handlers.py — все команды бота.
-Исправлено: обработка /add@bot, проверка приватных чатов, очистка кеша.
+
+Изменения:
+  - Все тексты про расписание говорят о московском времени (МСК).
+  - Часовой пояс берётся из settings.TIMEZONE (Europe/Moscow).
 """
 import logging
 import re
@@ -13,10 +16,12 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKey
 
 from config import settings
 from scheduler import _send_user_digest
-from channel_reader import get_telethon_client
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+# Человекочитаемое название часового пояса для сообщений
+_TZ_LABEL = "МСК" if settings.TIMEZONE == "Europe/Moscow" else settings.TIMEZONE
 
 
 # ── Утилиты ──────────────────────────────────────────────────────
@@ -36,7 +41,7 @@ def parse_channel_input(raw: str) -> str | None:
 
 
 def parse_time(s: str) -> tuple[int, int] | None:
-    """Парсит '09:00' или '9' → (9, 0)."""
+    """Парсит '09:00' или '9' → (9, 0). Время трактуется в settings.TIMEZONE."""
     s = s.strip()
     if ":" in s:
         parts = s.split(":")
@@ -76,13 +81,12 @@ def main_kb():
 async def cmd_start(message: Message, db):
     await db.upsert_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        "👋 Привет! Я новостной дайджест-бот на DeepSeek.\n\n"
+        "👋 Привет! Я новостной дайджест-бот на Gemini.\n\n"
         "<b>Что умею:</b>\n"
         "📱 Читать твои Telegram-каналы\n"
-        "🌐 Добавлять важные новости из интернета\n"
         "📊 Делать <b>Итог дня</b>\n"
         "📚 Кешировать статьи для оффлайн-чтения\n"
-        "⏰ Присылать дайджест в нужное время\n\n"
+        f"⏰ Присылать дайджест в нужное время ({_TZ_LABEL})\n\n"
         "Начни с /add чтобы добавить каналы,\n"
         "затем /schedule чтобы задать время дайджеста.",
         parse_mode="HTML", reply_markup=main_kb(),
@@ -107,7 +111,8 @@ async def cmd_help(message: Message):
         "/digest — получить дайджест прямо сейчас\n"
         "/cache — показать кешированные статьи\n"
         "/clearcache — очистить кеш статей\n\n"
-        "Время указывается в UTC. Примеры: <code>09:00</code>, <code>21:30</code>",
+        f"⏰ Время указывается в <b>{_TZ_LABEL}</b>. "
+        "Примеры: <code>09:00</code>, <code>21:30</code>",
         parse_mode="HTML",
     )
 
@@ -128,7 +133,6 @@ async def cmd_channels(message: Message, db):
 @router.message(Command("add"))
 @router.message(F.text == "➕ Добавить канал")
 async def cmd_add_start(message: Message, state: FSMContext, db):
-    # Правильный парсинг команды, даже если она с @bot
     text = message.text or ""
     parts = text.split(maxsplit=1)
     cmd = parts[0].split("@")[0] if parts else ""
@@ -192,7 +196,7 @@ async def cmd_remove(message: Message, db):
         parse_mode="HTML", reply_markup=main_kb())
 
 
-# ── Расписание ────────────────────────────────────────────────────
+# ── Расписание (время в МСК) ──────────────────────────────────────
 @router.message(Command("schedules"))
 @router.message(F.text == "⏰ Расписание")
 async def cmd_schedules(message: Message, db):
@@ -200,14 +204,17 @@ async def cmd_schedules(message: Message, db):
     if not schedules:
         await message.answer(
             "Расписание не задано.\n\n"
-            "Добавь: <code>/schedule 09:00</code>\n"
-            "Можно несколько: <code>/schedule 21:00</code>",
+            f"Добавь: <code>/schedule 09:00</code>\n"
+            f"Можно несколько: <code>/schedule 21:00</code>\n\n"
+            f"⏰ Время в <b>{_TZ_LABEL}</b>",
             parse_mode="HTML", reply_markup=main_kb())
         return
-    lines = "\n".join(f"• {s['hour']:02d}:{s['minute']:02d} UTC" for s in schedules)
+    lines = "\n".join(
+        f"• {s['hour']:02d}:{s['minute']:02d} {_TZ_LABEL}" for s in schedules
+    )
     await message.answer(
         f"⏰ <b>Расписание дайджестов:</b>\n\n{lines}\n\n"
-        "Удалить: <code>/unschedule 09:00</code>",
+        f"Удалить: <code>/unschedule 09:00</code>",
         parse_mode="HTML", reply_markup=main_kb())
 
 
@@ -220,17 +227,18 @@ async def cmd_schedule_add(message: Message, state: FSMContext, db):
             added = await db.add_schedule(message.from_user.id, t[0], t[1])
             if added:
                 await message.answer(
-                    f"✅ Дайджест будет приходить в <b>{t[0]:02d}:{t[1]:02d} UTC</b>",
+                    f"✅ Дайджест будет приходить в "
+                    f"<b>{t[0]:02d}:{t[1]:02d} {_TZ_LABEL}</b>",
                     parse_mode="HTML", reply_markup=main_kb())
             else:
                 await message.answer(
-                    f"⚠️ Время {t[0]:02d}:{t[1]:02d} уже задано.",
+                    f"⚠️ Время {t[0]:02d}:{t[1]:02d} {_TZ_LABEL} уже задано.",
                     reply_markup=main_kb())
             return
     await state.set_state(AddSchedule.waiting)
     await message.answer(
-        "Укажи время в формате <code>ЧЧ:ММ</code> (UTC):\n"
-        "Например: <code>09:00</code> или <code>21:30</code>",
+        f"Укажи время в формате <code>ЧЧ:ММ</code> ({_TZ_LABEL}):\n"
+        f"Например: <code>09:00</code> или <code>21:30</code>",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 
@@ -239,13 +247,14 @@ async def cmd_schedule_input(message: Message, state: FSMContext, db):
     await state.clear()
     t = parse_time(message.text.strip())
     if not t:
-        await message.answer("❌ Неверный формат. Пример: <code>09:00</code>",
-                             parse_mode="HTML", reply_markup=main_kb())
+        await message.answer(
+            f"❌ Неверный формат. Пример: <code>09:00</code> ({_TZ_LABEL})",
+            parse_mode="HTML", reply_markup=main_kb())
         return
     added = await db.add_schedule(message.from_user.id, t[0], t[1])
     if added:
         await message.answer(
-            f"✅ Дайджест в <b>{t[0]:02d}:{t[1]:02d} UTC</b> добавлен!",
+            f"✅ Дайджест в <b>{t[0]:02d}:{t[1]:02d} {_TZ_LABEL}</b> добавлен!",
             parse_mode="HTML", reply_markup=main_kb())
     else:
         await message.answer("⚠️ Время уже задано.", reply_markup=main_kb())
@@ -260,15 +269,15 @@ async def cmd_unschedule(message: Message, db):
             removed = await db.remove_schedule(message.from_user.id, t[0], t[1])
             if removed:
                 await message.answer(
-                    f"✅ Время {t[0]:02d}:{t[1]:02d} удалено из расписания.",
+                    f"✅ Время {t[0]:02d}:{t[1]:02d} {_TZ_LABEL} удалено из расписания.",
                     reply_markup=main_kb())
             else:
                 await message.answer(
-                    f"❌ Время {t[0]:02d}:{t[1]:02d} не найдено.",
+                    f"❌ Время {t[0]:02d}:{t[1]:02d} {_TZ_LABEL} не найдено.",
                     reply_markup=main_kb())
             return
     await message.answer(
-        "Формат: <code>/unschedule 09:00</code>",
+        f"Формат: <code>/unschedule 09:00</code> ({_TZ_LABEL})",
         parse_mode="HTML", reply_markup=main_kb())
 
 
@@ -325,8 +334,7 @@ async def cmd_clear_cache(message: Message, db):
         await message.answer("📭 Кеш уже пуст.", reply_markup=main_kb())
 
 
-# ── Защита от команд в группах (опционально) ─────────────────────
+# ── Игнор команд в группах ───────────────────────────────────────
 @router.message(F.chat.type != "private")
 async def ignore_non_private(message: Message):
-    # Игнорируем все сообщения в группах/каналах
     pass
