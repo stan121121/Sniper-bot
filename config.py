@@ -7,7 +7,10 @@ class Settings(BaseSettings):
 
     # Google Gemini
     GEMINI_API_KEY: str
-    GEMINI_MODEL: str = "gemini-3.8-flash"   # ← актуальная модель
+    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_FALLBACK_MODEL: str = "gemini-3.1-flash-lite"   # ← fallback
+    GEMINI_MAX_RETRIES: int = 5                             # ← количество попыток
+    GEMINI_RETRY_DELAY: float = 2.0                         # ← начальная задержка
 
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
