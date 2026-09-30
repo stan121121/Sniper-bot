@@ -1,15 +1,18 @@
 """
 summarizer.py — Google Gemini через Interactions API (google-genai SDK).
 Модель по умолчанию: gemini-3.8-flash.
+Fallback: gemini-3.1-flash-lite при перегрузке.
 
-Изменения по сравнению с предыдущей версией:
-  - Переход с generate_content() на Interactions API (client.aio.interactions.create)
-  - Модель обновлена до gemini-3.8-flash
+Изменения:
+  - Добавлен retry с экспоненциальной задержкой
+  - Добавлен fallback на более лёгкую модель
+  - Обработка 503 UNAVAILABLE
   - summarize_posts и fetch_web_news возвращают (items, error)
-  - Корректная обработка system_instruction и generation_config
 """
+import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,7 +21,6 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Gemini-клиент (единый на весь модуль)
 _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
@@ -29,7 +31,7 @@ class DigestItem:
     importance: int
     channel: str
     url: str
-    source_type: str = "telegram"   # "telegram" | "web"
+    source_type: str = "telegram"
 
 
 # ── Обработка ошибок ─────────────────────────────────────────────
@@ -39,42 +41,84 @@ _ERROR_HINTS = {
     403: "❌ Неверный GEMINI_API_KEY или API не включён. Проверь ключ: https://aistudio.google.com/app/apikey",
     400: "❌ Ошибка в запросе к Gemini. Возможно, превышен размер контекста.",
     404: "❌ Модель не найдена. Проверь GEMINI_MODEL (актуальная: gemini-3.8-flash).",
+    503: "⚠️ Gemini временно перегружен. Повторяю запрос...",
 }
+
+# Коды, при которых стоит повторить запрос
+_RETRYABLE_STATUS = {429, 503, 500, 502, 504}
+
+
+async def _gemini_call(model: str, system: str, user: str, max_tokens: int) -> str:
+    """Один вызов Gemini с указанной моделью."""
+    interaction = await _client.aio.interactions.create(
+        model=model,
+        input=user,
+        system_instruction=system,
+        generation_config={
+            "temperature": 0.3,
+            "max_output_tokens": max_tokens,
+        },
+    )
+    raw = interaction.output_text.strip()
+    if "```" in raw:
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else parts[0]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
 
 
 async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     """
-    Вызов Gemini через Interactions API.
-    Бросает RuntimeError с понятным сообщением при ошибках.
+    Вызов Gemini с retry и fallback.
+    Сначала пробует основную модель GEMINI_MODEL.
+    При 503 — экспоненциальная задержка и повтор.
+    После исчерпания попыток — fallback на GEMINI_FALLBACK_MODEL.
     """
-    try:
-        interaction = await _client.aio.interactions.create(
-            model=settings.GEMINI_MODEL,
-            input=user,
-            system_instruction=system,
-            generation_config={
-                "temperature": 0.3,
-                "max_output_tokens": max_tokens,
-            },
-        )
+    models = [settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL]
+    last_error = None
 
-        raw = interaction.output_text.strip()
+    for model_idx, model in enumerate(models):
+        if model_idx > 0:
+            logger.info("Falling back to model: %s", model)
 
-        # Очистка от markdown-бэктиков
-        if "```" in raw:
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith("json"):
-                raw = raw[4:]
+        for attempt in range(settings.GEMINI_MAX_RETRIES):
+            try:
+                result = await _gemini_call(model, system, user, max_tokens)
+                if model_idx > 0:
+                    logger.info("Fallback model %s succeeded", model)
+                return result
 
-        return raw.strip()
+            except Exception as e:
+                status = getattr(e, "status_code", None) or getattr(e, "code", None)
+                last_error = e
 
-    except Exception as e:
-        status = getattr(e, "status_code", None) or getattr(e, "code", None)
-        if status and status in _ERROR_HINTS:
-            raise RuntimeError(_ERROR_HINTS[status]) from e
-        logger.error("Gemini error: %s", e)
-        raise RuntimeError(f"⚠️ Ошибка Gemini API: {e}") from e
+                # Не retryable ошибки — сразу пробуем fallback
+                if status and status not in _RETRYABLE_STATUS:
+                    hint = _ERROR_HINTS.get(status, f"HTTP {status}")
+                    logger.error("Non-retryable error %s: %s", status, hint)
+                    break  # переходим к следующей модели
+
+                # Retryable ошибка — ждём и повторяем
+                if attempt < settings.GEMINI_MAX_RETRIES - 1:
+                    delay = settings.GEMINI_RETRY_DELAY * (2 ** attempt)
+                    delay += random.uniform(0, 1)  # jitter
+                    logger.warning(
+                        "Gemini %s error (attempt %d/%d), retrying in %.1fs: %s",
+                        status, attempt + 1, settings.GEMINI_MAX_RETRIES, delay, e
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "Model %s failed after %d attempts: %s",
+                        model, settings.GEMINI_MAX_RETRIES, e
+                    )
+
+    # Все модели и попытки исчерпаны
+    status = getattr(last_error, "status_code", None) or getattr(last_error, "code", None)
+    if status and status in _ERROR_HINTS:
+        raise RuntimeError(_ERROR_HINTS[status]) from last_error
+    raise RuntimeError(f"⚠️ Ошибка Gemini API после всех попыток: {last_error}") from last_error
 
 
 def _fmt_posts(posts) -> str:
@@ -92,15 +136,9 @@ def _fmt_posts(posts) -> str:
 # ── 1. Фильтрация Telegram-постов ────────────────────────────────
 
 async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
-    """
-    Возвращает (items, error).
-    error != None при сбое API — тогда items пустой, и scheduler НЕ помечает
-    посты как seen, чтобы повторить попытку при следующем запуске.
-    """
     if not posts:
         return [], None
 
-    # Ограничиваем количество постов, передаваемых в AI
     posts = sorted(posts, key=lambda p: p.date, reverse=True)
     posts = posts[: settings.MAX_POSTS_TO_AI]
 
@@ -147,10 +185,6 @@ async def fetch_web_news(
     topic: str = "главные новости дня",
     lang: str = "ru",
 ) -> tuple[list[DigestItem], Optional[str]]:
-    """
-    Возвращает (items, error).
-    error != None, если API недоступен — бот отправит пользователю подсказку.
-    """
     lang_str = "русский" if lang == "ru" else "english"
     system = (
         "Ты редактор новостного дайджеста. Составь список важных новостей "
