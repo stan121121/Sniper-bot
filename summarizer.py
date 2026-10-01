@@ -1,12 +1,14 @@
 """
 summarizer.py — Google Gemini через стабильный generate_content API.
 
-Ключевые изменения:
-  - Возврат с экспериментального Interactions API на models.generate_content
-  - Увеличен max_tokens для summarize_posts (3500 вместо 2000)
-  - Устойчивый парсинг JSON: если ответ обрезан, извлекаем целые объекты
-  - Модель работает СТРОГО с постами каналов (без интернета)
-  - Retry с экспоненциальной задержкой + fallback на резервную модель
+Ключевые особенности:
+  - Модель работает СТРОГО с постами каналов пользователя.
+    НЕ использует знания о мире, НЕ ищет новости в интернете.
+  - Улучшенный промпт: интерес-профиль, дедупликация с сохранением
+    различий в подаче (framing), поле why (почему важно).
+  - Устойчивый парсинг JSON: если ответ обрезан, извлекаем целые объекты.
+  - Retry с экспоненциальной задержкой + fallback на резервную модель.
+  - Динамический max_tokens в зависимости от MAX_NEWS_IN_DIGEST.
 """
 import asyncio
 import json
@@ -24,14 +26,18 @@ logger = logging.getLogger(__name__)
 _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
+# ── Модель данных ────────────────────────────────────────────────
+
 @dataclass
 class DigestItem:
     title: str
     summary: str
-    importance: int
-    channel: str
-    url: str
-    source_type: str = "telegram"
+    why: str = ""            # почему это важно
+    framing: str = ""        # различия в подаче между каналами
+    importance: int = 5
+    channel: str = ""
+    url: str = ""
+    source_type: str = "telegram"   # "telegram" | "web"
 
 
 # ── Обработка ошибок ─────────────────────────────────────────────
@@ -52,8 +58,7 @@ _RETRYABLE_STATUS = {429, 503, 500, 502, 504}
 def _extract_json_array(raw: str) -> list[dict]:
     """
     Пытается распарсить JSON-массив из ответа Gemini.
-    Если ответ обрезан — извлекает все целые объекты { ... } через regex.
-    Возвращает список словарей (пустой, если ничего не удалось).
+    Если ответ обрезан — извлекает все целые объекты { ... } вручную.
     """
     if not raw:
         return []
@@ -77,10 +82,8 @@ def _extract_json_array(raw: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # 3. Fallback: вытаскиваем целые объекты {...} через regex.
-    #    Работает даже если массив обрезан и не закрыт.
+    # 3. Fallback: ручной обход сбалансированных фигурных скобок
     items = []
-    # Ищем сбалансированные фигурные скобки вручную
     depth = 0
     start = None
     for i, ch in enumerate(cleaned):
@@ -97,7 +100,6 @@ def _extract_json_array(raw: str) -> list[dict]:
                     if isinstance(obj, dict):
                         items.append(obj)
                 except json.JSONDecodeError:
-                    # Пробуем починить типичные проблемы
                     fixed = _repair_json_chunk(chunk)
                     try:
                         obj = json.loads(fixed)
@@ -116,10 +118,8 @@ def _extract_json_array(raw: str) -> list[dict]:
 
 
 def _repair_json_chunk(chunk: str) -> str:
-    """Простые правки типичных ошибок: одиночные кавычки, висячие запятые."""
-    # Одиночные кавычки → двойные (грубо, но помогает в 90% случаев)
+    """Простые правки типичных ошибок JSON: одиночные кавычки, висячие запятые."""
     fixed = re.sub(r"(?<![\\])'", '"', chunk)
-    # Убираем висячие запятые перед } 
     fixed = re.sub(r",\s*}", "}", fixed)
     return fixed
 
@@ -135,7 +135,6 @@ async def _gemini_call(model: str, system: str, user: str, max_tokens: int) -> s
             "system_instruction": system,
             "temperature": 0.3,
             "max_output_tokens": max_tokens,
-            # Просим Gemini вернуть строго JSON
             "response_mime_type": "application/json",
         },
     )
@@ -145,7 +144,7 @@ async def _gemini_call(model: str, system: str, user: str, max_tokens: int) -> s
 async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     """
     Вызов Gemini с retry и fallback.
-    Сначала пробует GEMINI_MODEL, при 503/429 — экспоненциальная задержка,
+    Сначала GEMINI_MODEL, при 503/429 — экспоненциальная задержка,
     затем fallback на GEMINI_FALLBACK_MODEL.
     """
     models = [settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL]
@@ -191,11 +190,14 @@ async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
     raise RuntimeError(f"⚠️ Ошибка Gemini API после всех попыток: {last_error}") from last_error
 
 
+# ── Форматирование постов для промпта ────────────────────────────
+
 def _fmt_posts(posts) -> str:
+    """Компактное представление постов для промпта."""
     lines = []
     for i, p in enumerate(posts, 1):
         date_str = p.date.strftime("%d.%m %H:%M")
-        text = p.text[:300].replace(chr(10), " ")
+        text = p.text[:400].replace(chr(10), " ")
         lines.append(
             f"[{i}] @{p.channel} | {date_str}\n"
             f"{text}\n"
@@ -204,7 +206,64 @@ def _fmt_posts(posts) -> str:
     return "\n\n".join(lines)
 
 
-# ── 1. Фильтрация Telegram-постов (только каналы пользователя) ───
+# ── 1. Фильтрация Telegram-постов ────────────────────────────────
+
+_SYSTEM_PROMPT = (
+    "Ты — редактор персонального новостного дайджеста из Telegram-каналов.\n"
+    "Твоя задача — отобрать важные посты из ПРЕДОСТАВЛЕННОГО СПИСКА "
+    "и сжать их до коротких, информативных резюме.\n\n"
+
+    "═══ ЖЁСТКИЕ ПРАВИЛА ═══\n\n"
+
+    "1. ИСТОЧНИК ИНФОРМАЦИИ — только тексты постов из списка.\n"
+    "   • НЕ добавляй факты, имена, числа, даты и события, которых нет в постах.\n"
+    "   • НЕ используй свои знания о мире.\n"
+    "   • НЕ ищи новости в интернете.\n"
+    "   • Если в посте чего-то нет — не додумывай.\n\n"
+
+    "2. ДЕДУПЛИКАЦИЯ.\n"
+    "   • Если несколько постов описывают одно событие — объедини их в одну запись.\n"
+    "   • Сохрани различия в подаче: если каналы трактуют событие по-разному, "
+    "отметь это в поле framing.\n"
+    "   • В поле channel укажи все каналы через запятую.\n"
+    "   • В поле url — ссылку на самый содержательный пост.\n\n"
+
+    "3. ФИЛЬТРАЦИЯ.\n"
+    "   Отбрасывай: рекламу, репосты без добавленной ценности, мемы, "
+    "поздравления, дубли, погоду, спорт без значимого контекста, "
+    "светскую хронику, локальные происшествия без широкого значения.\n\n"
+
+    "4. ПРИОРИТЕТЫ (что считать важным):\n"
+    "   1) Технологии и AI — продукты, политика, бизнес\n"
+    "   2) Бизнес, стартапы, предпринимательство\n"
+    "   3) Экономика: рынки, макро, торговля, ставки\n"
+    "   4) Политические решения с реальными последствиями\n"
+    "   5) Регуляторные изменения (налоги, законы, санкции)\n"
+    "   6) Качественные аналитические посты, меняющие взгляд на тему\n\n"
+
+    "5. ФОРМАТ.\n"
+    "   • Отвечай СТРОГО JSON-массивом объектов.\n"
+    "   • Без markdown, без бэктиков, без пояснений до или после JSON.\n"
+    "   • Все текстовые поля — на русском языке.\n\n"
+
+    "═══ СХЕМА ОБЪЕКТА ═══\n\n"
+    "{\n"
+    '  "title":      "до 80 символов, конкретный, без кликбейта",\n'
+    '  "summary":    "1–2 предложения: что произошло. Только факты из поста.",\n'
+    '  "why":        "1 предложение: почему это важно.",\n'
+    '  "framing":    "различия в подаче между каналами (или пустая строка)",\n'
+    '  "importance": 1-10,\n'
+    '  "channel":    "@канал1, @канал2",\n'
+    '  "url":        "ссылка из поста или пустая строка"\n'
+    "}\n\n"
+
+    "═══ ОГРАНИЧЕНИЯ ═══\n\n"
+    "• Не более MAX_NEWS важных новостей (см. пользовательский запрос).\n"
+    "• Если подходящих постов меньше — верни меньше, НЕ добивай список мусором.\n"
+    "• Если все посты — мусор, верни пустой массив [].\n"
+    "• Не более 10 объектов в ответе, даже если постов много.\n"
+)
+
 
 async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
     """
@@ -217,30 +276,19 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
     posts = sorted(posts, key=lambda p: p.date, reverse=True)
     posts = posts[: settings.MAX_POSTS_TO_AI]
 
-    system = (
-        "Ты редактор новостного дайджеста. Отбери важные посты из списка "
-        "и сожми их до коротких резюме.\n\n"
-        "ПРАВИЛА:\n"
-        "1. Используй ТОЛЬКО информацию из постов. Не добавляй факты из своих знаний.\n"
-        "2. Не ищи новости в интернете.\n"
-        "3. Отфильтруй рекламу, репосты без ценности, дубли.\n"
-        "4. Поле url бери строго из поста.\n"
-        "5. Отвечай МАКСИМАЛЬНО КРАТКО: title до 60 символов, summary 1-2 предложения.\n"
-        "6. Ответ — JSON-массив объектов. Без markdown, без пояснений."
-    )
     user = (
-        f"Постов: {len(posts)}. Выбери не более {settings.MAX_NEWS_IN_DIGEST} важных.\n\n"
-        "Формат каждого объекта:\n"
-        '{"title": "...", "summary": "...", "importance": 7, "channel": "@...", "url": "..."}\n\n'
+        f"Проанализируй {len(posts)} постов из Telegram-каналов пользователя.\n"
+        f"Отбери не более {settings.MAX_NEWS_IN_DIGEST} самых важных "
+        "и верни JSON-массив по схеме.\n\n"
         f"Посты:\n{_fmt_posts(posts)}\n\n"
-        "Верни JSON-массив:"
+        "Ответ — JSON-массив:"
     )
 
-    # Даём щедрый лимит, чтобы JSON не обрезался
-    max_tokens = 500 + settings.MAX_NEWS_IN_DIGEST * 250
+    # Щедрый лимит: 700 базовых + 350 на каждую новость
+    max_tokens = 700 + settings.MAX_NEWS_IN_DIGEST * 350
 
     try:
-        raw = await _gemini(system, user, max_tokens=max_tokens)
+        raw = await _gemini(_SYSTEM_PROMPT, user, max_tokens=max_tokens)
         data = _extract_json_array(raw)
 
         items = []
@@ -249,6 +297,8 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
                 items.append(DigestItem(
                     title=str(d.get("title", ""))[:200],
                     summary=str(d.get("summary", ""))[:1000],
+                    why=str(d.get("why", ""))[:500],
+                    framing=str(d.get("framing", ""))[:500],
                     importance=int(d.get("importance", 5)),
                     channel=str(d.get("channel", "")),
                     url=str(d.get("url", "")),
@@ -284,17 +334,18 @@ async def fetch_web_news(
     user = (
         f"Составь {settings.MAX_NEWS_IN_DIGEST} важных новостей по теме: {topic}.\n"
         f"Язык: {lang_str}.\n"
-        'Поля: "title", "summary", "importance" (1-10), "source", "url".\n'
+        'Поля: "title", "summary", "why", "importance" (1-10), "source", "url".\n'
         "JSON:"
     )
 
     try:
-        raw = await _gemini(system, user, max_tokens=500 + settings.MAX_NEWS_IN_DIGEST * 250)
+        raw = await _gemini(system, user, max_tokens=700 + settings.MAX_NEWS_IN_DIGEST * 350)
         data = _extract_json_array(raw)
         items = [
             DigestItem(
                 title=str(d.get("title", "")),
                 summary=str(d.get("summary", "")),
+                why=str(d.get("why", "")),
                 importance=int(d.get("importance", 5)),
                 channel=str(d.get("source", "Web")),
                 url=str(d.get("url", "")),
@@ -325,14 +376,13 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
 
     system = (
         f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений. Используй ТОЛЬКО "
-        f"перечисленные новости. Язык: {lang_str}. Стиль: деловой. "
-        f"Без markdown, только обычный текст."
+        f"перечисленные новости, не добавляй факты из своих знаний. "
+        f"Язык: {lang_str}. Стиль: деловой. Без markdown, только обычный текст."
     )
     user = f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:"
 
     try:
         summary = await _gemini(system, user, max_tokens=600)
-        # Убираем возможные markdown-артефакты
         summary = summary.strip().strip('"').strip("'")
         return summary
     except RuntimeError as e:
@@ -343,9 +393,10 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
         return ""
 
 
-# ── 4. Форматирование ─────────────────────────────────────────────
+# ── 4. Форматирование для Telegram ───────────────────────────────
 
 def _he(t: str) -> str:
+    """Экранирование HTML для Telegram."""
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -353,14 +404,22 @@ _IMP_EMOJI = {10: "🔴", 9: "🔴", 8: "🟠", 7: "🟠", 6: "🟡", 5: "🟡"}
 
 
 def _item_html(item: DigestItem) -> str:
+    """HTML-представление одной новости."""
     emoji = _IMP_EMOJI.get(item.importance, "🟢")
     icon = "🌐" if item.source_type == "web" else "📣"
     link = f' | <a href="{item.url}">Читать →</a>' if item.url else ""
-    return (
-        f'{emoji} <b>{_he(item.title)}</b>\n'
-        f'{_he(item.summary)}\n'
-        f'<i>{icon} {_he(item.channel)}</i>{link}\n'
-    )
+
+    block = f'{emoji} <b>{_he(item.title)}</b>\n'
+    block += f'{_he(item.summary)}\n'
+
+    if item.why:
+        block += f'<b>Почему важно:</b> {_he(item.why)}\n'
+
+    if item.framing:
+        block += f'<b>Разные взгляды:</b> <i>{_he(item.framing)}</i>\n'
+
+    block += f'<i>{icon} {_he(item.channel)}</i>{link}\n'
+    return block
 
 
 def format_digest_message(
@@ -370,6 +429,7 @@ def format_digest_message(
     api_error: Optional[str] = None,
     lang: str = "ru",
 ) -> str:
+    """Собирает финальное сообщение дайджеста."""
     parts = []
 
     if tg_items:
