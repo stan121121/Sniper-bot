@@ -1,5 +1,6 @@
 """
-database.py — SQLite с индексами для производительности.
+database.py — SQLite: пользователи, каналы, расписания, история дайджестов.
+Кеширование статей УДАЛЕНО — не используется.
 """
 import aiosqlite
 import logging
@@ -58,17 +59,6 @@ class Database:
                     UNIQUE(user_id, channel, post_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS article_cache (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id     INTEGER NOT NULL,
-                    url         TEXT NOT NULL,
-                    title       TEXT,
-                    full_text   TEXT,
-                    source      TEXT,
-                    cached_at   TEXT DEFAULT (datetime('now')),
-                    UNIQUE(user_id, url)
-                );
-
                 -- Индексы для ускорения запросов
                 CREATE INDEX IF NOT EXISTS idx_seen_user_channel
                     ON seen_posts(user_id, channel);
@@ -76,8 +66,6 @@ class Database:
                     ON schedules(user_id, hour, minute);
                 CREATE INDEX IF NOT EXISTS idx_digest_log_user
                     ON digest_log(user_id);
-                CREATE INDEX IF NOT EXISTS idx_article_cache_user
-                    ON article_cache(user_id, cached_at DESC);
             """)
             await db.commit()
         logger.info("Database initialized: %s", self.path)
@@ -196,56 +184,11 @@ class Database:
             seen = {r[0] for r in await cur.fetchall()}
         return [pid for pid in post_ids if pid not in seen]
 
-    # ── Кеш статей ───────────────────────────────────────────────
-    async def cache_article(self, user_id: int, url: str, title: str,
-                             full_text: str, source: str):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """INSERT INTO article_cache(user_id,url,title,full_text,source)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(user_id,url) DO UPDATE SET
-                     full_text=excluded.full_text,
-                     title=excluded.title,
-                     cached_at=datetime('now')""",
-                (user_id, url, title, full_text, source),
-            )
-            await db.commit()
-
-    async def get_cached_article(self, user_id: int, url: str) -> Optional[dict]:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT * FROM article_cache WHERE user_id=? AND url=?",
-                (user_id, url),
-            )
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-    async def get_user_cache(self, user_id: int, limit: int = 20) -> list[dict]:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                """SELECT id, title, url, source, cached_at
-                   FROM article_cache WHERE user_id=?
-                   ORDER BY cached_at DESC LIMIT ?""",
-                (user_id, limit),
-            )
-            return [dict(r) for r in await cur.fetchall()]
-
-    async def delete_cached_article(self, user_id: int, article_id: int) -> bool:
+    async def reset_seen(self, user_id: int) -> int:
+        """Сбросить историю просмотренных постов пользователя."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "DELETE FROM article_cache WHERE user_id=? AND id=?",
-                (user_id, article_id),
-            )
-            await db.commit()
-            return cur.rowcount > 0
-
-    async def clear_user_cache(self, user_id: int) -> int:
-        """Удалить все статьи пользователя из кеша."""
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "DELETE FROM article_cache WHERE user_id=?", (user_id,)
+                "DELETE FROM seen_posts WHERE user_id=?", (user_id,)
             )
             await db.commit()
             return cur.rowcount
