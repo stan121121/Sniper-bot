@@ -1,9 +1,7 @@
 """
 handlers.py — все команды бота.
-
-Изменения:
-  - Все тексты про расписание говорят о московском времени (МСК).
-  - Часовой пояс берётся из settings.TIMEZONE (Europe/Moscow).
+Кеширование статей УДАЛЕНО: нет кнопки «Кеш статей», команд /cache, /clearcache.
+Добавлена команда /resetseen для сброса истории просмотренных постов.
 """
 import logging
 import re
@@ -72,7 +70,7 @@ def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📋 Каналы"), KeyboardButton(text="➕ Добавить канал")],
         [KeyboardButton(text="⏰ Расписание"), KeyboardButton(text="📰 Дайджест сейчас")],
-        [KeyboardButton(text="📚 Кеш статей"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="ℹ️ Помощь")],
     ], resize_keyboard=True)
 
 
@@ -85,7 +83,6 @@ async def cmd_start(message: Message, db):
         "<b>Что умею:</b>\n"
         "📱 Читать твои Telegram-каналы\n"
         "📊 Делать <b>Итог дня</b>\n"
-        "📚 Кешировать статьи для оффлайн-чтения\n"
         f"⏰ Присылать дайджест в нужное время ({_TZ_LABEL})\n\n"
         "Начни с /add чтобы добавить каналы,\n"
         "затем /schedule чтобы задать время дайджеста.",
@@ -109,8 +106,7 @@ async def cmd_help(message: Message):
         "/schedules — показать расписание\n\n"
         "<b>Дайджест:</b>\n"
         "/digest — получить дайджест прямо сейчас\n"
-        "/cache — показать кешированные статьи\n"
-        "/clearcache — очистить кеш статей\n\n"
+        "/resetseen — сбросить историю просмотренных постов\n\n"
         f"⏰ Время указывается в <b>{_TZ_LABEL}</b>. "
         "Примеры: <code>09:00</code>, <code>21:30</code>",
         parse_mode="HTML",
@@ -196,7 +192,7 @@ async def cmd_remove(message: Message, db):
         parse_mode="HTML", reply_markup=main_kb())
 
 
-# ── Расписание (время в МСК) ──────────────────────────────────────
+# ── Расписание ────────────────────────────────────────────────────
 @router.message(Command("schedules"))
 @router.message(F.text == "⏰ Расписание")
 async def cmd_schedules(message: Message, db):
@@ -301,37 +297,17 @@ async def cmd_digest_now(message: Message, db):
             parse_mode="HTML", reply_markup=main_kb())
 
 
-# ── Кеш статей ────────────────────────────────────────────────────
-@router.message(Command("cache"))
-@router.message(F.text == "📚 Кеш статей")
-async def cmd_cache(message: Message, db):
-    articles = await db.get_user_cache(message.from_user.id, limit=10)
-    if not articles:
-        await message.answer(
-            "📭 Кеш пуст.\n\nСтатьи сохраняются автоматически после каждого дайджеста.",
-            reply_markup=main_kb())
-        return
-    lines = []
-    for a in articles:
-        date_str = a["cached_at"][:16]
-        url_part = f' <a href="{a["url"]}">↗</a>' if a["url"] else ""
-        lines.append(f'• <b>{he(a["title"][:60])}</b>{url_part}\n'
-                     f'  <i>{he(a["source"])} · {date_str}</i>')
-    await message.answer(
-        f"📚 <b>Кеш статей</b> (последние 10):\n\n" + "\n\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=main_kb())
-
-
-@router.message(Command("clearcache"))
-async def cmd_clear_cache(message: Message, db):
-    count = await db.clear_user_cache(message.from_user.id)
+# ── Сброс истории просмотренных ──────────────────────────────────
+@router.message(Command("resetseen"))
+async def cmd_reset_seen(message: Message, db):
+    count = await db.reset_seen(message.from_user.id)
     if count:
-        await message.answer(f"🗑 Удалено статей: <b>{count}</b>",
-                             parse_mode="HTML", reply_markup=main_kb())
+        await message.answer(
+            f"♻️ Сброшено <b>{count}</b> записей. "
+            "Следующий /digest покажет все посты заново.",
+            parse_mode="HTML", reply_markup=main_kb())
     else:
-        await message.answer("📭 Кеш уже пуст.", reply_markup=main_kb())
+        await message.answer("📭 История уже пуста.", reply_markup=main_kb())
 
 
 # ── Игнор команд в группах ───────────────────────────────────────
