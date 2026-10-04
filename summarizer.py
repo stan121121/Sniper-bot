@@ -3,12 +3,11 @@ summarizer.py — Google Gemini через стабильный generate_content
 
 Ключевые особенности:
   - Модель работает СТРОГО с постами каналов пользователя.
-    НЕ использует знания о мире, НЕ ищет новости в интернете.
-  - Улучшенный промпт: интерес-профиль, дедупликация с сохранением
-    различий в подаче (framing), поле why (почему важно).
+  - Улучшенный промпт: интерес-профиль, дедупликация, why/framing.
   - Устойчивый парсинг JSON: если ответ обрезан, извлекаем целые объекты.
   - Retry с экспоненциальной задержкой + fallback на резервную модель.
-  - Динамический max_tokens в зависимости от MAX_NEWS_IN_DIGEST.
+  - json_mode: JSON включается только там, где нужен (summarize_posts),
+    а для «Итога дня» используется чистый текст.
 """
 import asyncio
 import json
@@ -32,12 +31,12 @@ _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 class DigestItem:
     title: str
     summary: str
-    why: str = ""            # почему это важно
-    framing: str = ""        # различия в подаче между каналами
+    why: str = ""
+    framing: str = ""
     importance: int = 5
     channel: str = ""
     url: str = ""
-    source_type: str = "telegram"   # "telegram" | "web"
+    source_type: str = "telegram"
 
 
 # ── Обработка ошибок ─────────────────────────────────────────────
@@ -56,14 +55,10 @@ _RETRYABLE_STATUS = {429, 503, 500, 502, 504}
 # ── Устойчивый парсинг JSON ──────────────────────────────────────
 
 def _extract_json_array(raw: str) -> list[dict]:
-    """
-    Пытается распарсить JSON-массив из ответа Gemini.
-    Если ответ обрезан — извлекает все целые объекты { ... } вручную.
-    """
+    """Парсит JSON-массив из ответа Gemini, выдерживая обрезанные ответы."""
     if not raw:
         return []
 
-    # 1. Чистим markdown-обёртки
     cleaned = raw.strip()
     if "```" in cleaned:
         parts = cleaned.split("```")
@@ -72,7 +67,6 @@ def _extract_json_array(raw: str) -> list[dict]:
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
 
-    # 2. Пробуем обычный парсинг
     try:
         data = json.loads(cleaned)
         if isinstance(data, list):
@@ -82,7 +76,7 @@ def _extract_json_array(raw: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # 3. Fallback: ручной обход сбалансированных фигурных скобок
+    # Fallback: обход сбалансированных фигурных скобок
     items = []
     depth = 0
     start = None
@@ -100,9 +94,8 @@ def _extract_json_array(raw: str) -> list[dict]:
                     if isinstance(obj, dict):
                         items.append(obj)
                 except json.JSONDecodeError:
-                    fixed = _repair_json_chunk(chunk)
                     try:
-                        obj = json.loads(fixed)
+                        obj = json.loads(_repair_json_chunk(chunk))
                         if isinstance(obj, dict):
                             items.append(obj)
                     except json.JSONDecodeError:
@@ -118,34 +111,101 @@ def _extract_json_array(raw: str) -> list[dict]:
 
 
 def _repair_json_chunk(chunk: str) -> str:
-    """Простые правки типичных ошибок JSON: одиночные кавычки, висячие запятые."""
+    """Правки типичных ошибок JSON: одиночные кавычки, висячие запятые."""
     fixed = re.sub(r"(?<![\\])'", '"', chunk)
     fixed = re.sub(r",\s*}", "}", fixed)
     return fixed
 
 
+def _extract_plain_text(raw: str) -> str:
+    """
+    Извлекает чистый текст из ответа Gemini.
+    Если модель всё же вернула JSON-объект (вида {"daily_summary": "..."}),
+    вытаскиваем значение первого строкового поля.
+    """
+    if not raw:
+        return ""
+
+    cleaned = raw.strip()
+
+    # Убираем markdown-обёртки
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = parts[1] if len(parts) > 1 else parts[0]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    # Если это JSON-объект — вытаскиваем первое строковое значение
+    if cleaned.startswith("{"):
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                for key in ("daily_summary", "summary", "text", "итог", "итог_дня"):
+                    if key in data and isinstance(data[key], str):
+                        return data[key].strip()
+                # Если ключ неизвестен — берём первое строковое значение
+                for v in data.values():
+                    if isinstance(v, str):
+                        return v.strip()
+        except json.JSONDecodeError:
+            pass
+
+    # Если это JSON-массив — склеиваем строки
+    if cleaned.startswith("["):
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, list):
+                parts = [str(x) for x in data if isinstance(x, (str, int, float))]
+                if parts:
+                    return " ".join(parts).strip()
+        except json.JSONDecodeError:
+            pass
+
+    # Иначе — просто текст
+    return cleaned.strip().strip('"').strip("'")
+
+
 # ── Вызов Gemini ─────────────────────────────────────────────────
 
-async def _gemini_call(model: str, system: str, user: str, max_tokens: int) -> str:
-    """Один вызов Gemini через стабильный generate_content."""
+async def _gemini_call(
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    json_mode: bool = True,
+) -> str:
+    """
+    Один вызов Gemini через стабильный generate_content.
+
+    json_mode=True  — модель обязана вернуть валидный JSON.
+    json_mode=False — модель возвращает обычный текст (для «Итога дня»).
+    """
+    config = {
+        "system_instruction": system,
+        "temperature": 0.3,
+        "max_output_tokens": max_tokens,
+    }
+    if json_mode:
+        config["response_mime_type"] = "application/json"
+
     response = await _client.aio.models.generate_content(
         model=model,
         contents=user,
-        config={
-            "system_instruction": system,
-            "temperature": 0.3,
-            "max_output_tokens": max_tokens,
-            "response_mime_type": "application/json",
-        },
+        config=config,
     )
     return (response.text or "").strip()
 
 
-async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
+async def _gemini(
+    system: str,
+    user: str,
+    max_tokens: int = 2000,
+    json_mode: bool = True,
+) -> str:
     """
     Вызов Gemini с retry и fallback.
-    Сначала GEMINI_MODEL, при 503/429 — экспоненциальная задержка,
-    затем fallback на GEMINI_FALLBACK_MODEL.
+    json_mode прокидывается в _gemini_call.
     """
     models = [settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL]
     last_error = None
@@ -156,7 +216,7 @@ async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
 
         for attempt in range(settings.GEMINI_MAX_RETRIES):
             try:
-                result = await _gemini_call(model, system, user, max_tokens)
+                result = await _gemini_call(model, system, user, max_tokens, json_mode)
                 if model_idx > 0:
                     logger.info("Fallback model %s succeeded", model)
                 return result
@@ -193,7 +253,6 @@ async def _gemini(system: str, user: str, max_tokens: int = 2000) -> str:
 # ── Форматирование постов для промпта ────────────────────────────
 
 def _fmt_posts(posts) -> str:
-    """Компактное представление постов для промпта."""
     lines = []
     for i, p in enumerate(posts, 1):
         date_str = p.date.strftime("%d.%m %H:%M")
@@ -266,10 +325,7 @@ _SYSTEM_PROMPT = (
 
 
 async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
-    """
-    Отбирает важные посты ТОЛЬКО из переданного списка.
-    Возвращает (items, error).
-    """
+    """Отбирает важные посты ТОЛЬКО из переданного списка."""
     if not posts:
         return [], None
 
@@ -284,11 +340,10 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
         "Ответ — JSON-массив:"
     )
 
-    # Щедрый лимит: 700 базовых + 350 на каждую новость
     max_tokens = 700 + settings.MAX_NEWS_IN_DIGEST * 350
 
     try:
-        raw = await _gemini(_SYSTEM_PROMPT, user, max_tokens=max_tokens)
+        raw = await _gemini(_SYSTEM_PROMPT, user, max_tokens=max_tokens, json_mode=True)
         data = _extract_json_array(raw)
 
         items = []
@@ -339,7 +394,11 @@ async def fetch_web_news(
     )
 
     try:
-        raw = await _gemini(system, user, max_tokens=700 + settings.MAX_NEWS_IN_DIGEST * 350)
+        raw = await _gemini(
+            system, user,
+            max_tokens=700 + settings.MAX_NEWS_IN_DIGEST * 350,
+            json_mode=True,
+        )
         data = _extract_json_array(raw)
         items = [
             DigestItem(
@@ -363,9 +422,13 @@ async def fetch_web_news(
         return [], None
 
 
-# ── 3. Итог дня ──────────────────────────────────────────────────
+# ── 3. Итог дня (чистый текст, без JSON) ─────────────────────────
 
 async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str:
+    """
+    Генерирует «Итог дня» как обычный текст.
+    json_mode=False, чтобы модель не оборачивала ответ в JSON.
+    """
     if not items:
         return ""
 
@@ -375,15 +438,25 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
     lang_str = "русский" if lang == "ru" else "english"
 
     system = (
-        f"Ты аналитик. Напиши ИТОГ ДНЯ — 3-5 предложений. Используй ТОЛЬКО "
-        f"перечисленные новости, не добавляй факты из своих знаний. "
-        f"Язык: {lang_str}. Стиль: деловой. Без markdown, только обычный текст."
+        f"Ты аналитик новостей. Напиши связный ИТОГ ДНЯ — 3-5 предложений "
+        f"о том, что главное произошло. Используй ТОЛЬКО перечисленные ниже "
+        f"новости, не добавляй факты из своих знаний.\n\n"
+        f"Язык: {lang_str}.\n"
+        f"Стиль: деловой, без вводных фраз вроде «сегодня», «в этот день».\n"
+        f"Формат: обычный текст. НЕ используй JSON, кавычки, markdown, "
+        f"заголовки, ключи вида \"daily_summary\".\n"
+        f"Просто напиши 3-5 предложений подряд."
     )
-    user = f"Новости дня:\n{digest_text}\n\nНапиши ИТОГ ДНЯ:"
+    user = (
+        f"Новости дня:\n{digest_text}\n\n"
+        "Напиши ИТОГ ДНЯ (обычный текст, 3-5 предложений):"
+    )
 
     try:
-        summary = await _gemini(system, user, max_tokens=600)
-        summary = summary.strip().strip('"').strip("'")
+        # json_mode=False — модель вернёт чистый текст
+        summary = await _gemini(system, user, max_tokens=600, json_mode=False)
+        # На случай если модель всё равно вернула JSON — вытащим текст
+        summary = _extract_plain_text(summary)
         return summary
     except RuntimeError as e:
         logger.warning("day_summary skipped: %s", e)
@@ -396,7 +469,6 @@ async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str
 # ── 4. Форматирование для Telegram ───────────────────────────────
 
 def _he(t: str) -> str:
-    """Экранирование HTML для Telegram."""
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -404,7 +476,6 @@ _IMP_EMOJI = {10: "🔴", 9: "🔴", 8: "🟠", 7: "🟠", 6: "🟡", 5: "🟡"}
 
 
 def _item_html(item: DigestItem) -> str:
-    """HTML-представление одной новости."""
     emoji = _IMP_EMOJI.get(item.importance, "🟢")
     icon = "🌐" if item.source_type == "web" else "📣"
     link = f' | <a href="{item.url}">Читать →</a>' if item.url else ""
@@ -429,7 +500,6 @@ def format_digest_message(
     api_error: Optional[str] = None,
     lang: str = "ru",
 ) -> str:
-    """Собирает финальное сообщение дайджеста."""
     parts = []
 
     if tg_items:
@@ -446,7 +516,8 @@ def format_digest_message(
         return "📭 Новостей нет — всё тихо." if lang == "ru" else "📭 No news — all quiet."
 
     if day_summary:
-        parts.append(f"\n\n📊 <b>Итог дня</b>\n<i>{_he(day_summary)}</i>")
+        # Никаких <i>...</i> вокруг — просто аккуратный абзац
+        parts.append(f"\n\n📊 <b>Итог дня</b>\n{_he(day_summary)}")
 
     if api_error:
         parts.append(f"\n\n⚠️ <i>{_he(api_error)}</i>")
