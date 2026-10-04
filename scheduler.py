@@ -1,13 +1,8 @@
 """
 scheduler.py — тик каждую минуту.
 
-Изменения:
-  - Расписание пользователя хранится в МСК (Europe/Moscow).
-  - tick() вычисляет ТЕКУЩЕЕ время в этом часовом поясе и сравнивает
-    с сохранёнными hour/minute.
-  - Веб-новости не вызываются: бот работает только с каналами.
-  - summarize_posts возвращает (items, error); посты помечаются seen
-    только при успешном ответе AI.
+Кеширование статей УДАЛЕНО: нет вызовов db.cache_article().
+Расписание в settings.TIMEZONE (по умолчанию Europe/Moscow).
 """
 import asyncio
 import logging
@@ -28,12 +23,11 @@ from summarizer import (
 
 logger = logging.getLogger(__name__)
 
-# Часовой пояс из настроек (по умолчанию Europe/Moscow)
 _TZ = ZoneInfo(settings.TIMEZONE)
 
 
 async def tick(bot: Bot, db: Database):
-    """Каждую минуту: проверяем у кого сейчас время дайджеста (по МСК)."""
+    """Каждую минуту: проверяем у кого сейчас время дайджеста."""
     now = datetime.now(_TZ)
     user_ids = await db.get_users_for_time(now.hour, now.minute)
     if not user_ids:
@@ -134,15 +128,6 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
         except Exception as e:
             logger.error("Failed to send chunk to %d: %s", user_id, e)
         await asyncio.sleep(0.3)
-
-    # 5. Кеш для оффлайн
-    for item in all_items:
-        if item.url:
-            await db.cache_article(
-                user_id=user_id, url=item.url,
-                title=item.title, full_text=item.summary,
-                source=item.channel,
-            )
 
     await db.log_digest(user_id, len(all_items), day_summary)
     logger.info("User %d: sent %d items (tg=%d).",
