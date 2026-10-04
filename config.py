@@ -18,8 +18,8 @@ class Settings(BaseSettings):
 
     # Дайджест
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
-    POSTS_PER_CHANNEL: int = 20
-    MAX_NEWS_IN_DIGEST: int = 10
+    POSTS_PER_CHANNEL: int = 25
+    MAX_NEWS_IN_DIGEST: int = 25
     MAX_POSTS_TO_AI: int = 50
     DIGEST_LANGUAGE: str = "ru"
     DB_PATH: str = "bot_data.db"
