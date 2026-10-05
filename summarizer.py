@@ -1,13 +1,12 @@
 """
 summarizer.py — Google Gemini через стабильный generate_content API.
 
-Ключевые особенности:
-  - Модель работает СТРОГО с постами каналов пользователя.
-  - Улучшенный промпт: интерес-профиль, дедупликация, why/framing.
-  - Устойчивый парсинг JSON: если ответ обрезан, извлекаем целые объекты.
-  - Retry с экспоненциальной задержкой + fallback на резервную модель.
-  - json_mode: JSON включается только там, где нужен (summarize_posts),
-    а для «Итога дня» используется чистый текст.
+Стратегия оптимизации:
+  - Промпты на английском → ~2-3x меньше токенов на входе.
+  - Все выходные текстовые поля — на русском (жёстко зафиксировано).
+  - Устойчивый парсинг JSON (выдерживает обрезанные ответы).
+  - Retry + fallback на резервную модель.
+  - json_mode включается только там, где нужен JSON.
 """
 import asyncio
 import json
@@ -42,10 +41,10 @@ class DigestItem:
 # ── Обработка ошибок ─────────────────────────────────────────────
 
 _ERROR_HINTS = {
-    429: "⚠️ Превышен лимит запросов Gemini. Попробуй позже.",
+    400: "❌ Gemini отклонил запрос (400). Проверь размер контекста или формат.",
+    429: "⚠️ Лимит запросов Gemini. Попробуй позже.",
     403: "❌ Неверный GEMINI_API_KEY или API не включён.",
-    400: "❌ Ошибка в запросе к Gemini. Возможно, превышен размер контекста.",
-    404: "❌ Модель не найдена. Проверь GEMINI_MODEL (актуальная: gemini-3.8-flash).",
+    404: "❌ Модель не найдена. Проверь GEMINI_MODEL.",
     503: "⚠️ Gemini временно перегружен. Повторяю запрос...",
 }
 
@@ -76,7 +75,7 @@ def _extract_json_array(raw: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: обход сбалансированных фигурных скобок
+    # Fallback: обход сбалансированных скобок
     items = []
     depth = 0
     start = None
@@ -99,7 +98,7 @@ def _extract_json_array(raw: str) -> list[dict]:
                         if isinstance(obj, dict):
                             items.append(obj)
                     except json.JSONDecodeError:
-                        logger.debug("Skipped malformed JSON chunk: %s", chunk[:120])
+                        logger.debug("Skipped malformed chunk: %s", chunk[:120])
                 start = None
 
     if items:
@@ -111,24 +110,18 @@ def _extract_json_array(raw: str) -> list[dict]:
 
 
 def _repair_json_chunk(chunk: str) -> str:
-    """Правки типичных ошибок JSON: одиночные кавычки, висячие запятые."""
+    """Правки типичных ошибок JSON."""
     fixed = re.sub(r"(?<![\\])'", '"', chunk)
     fixed = re.sub(r",\s*}", "}", fixed)
     return fixed
 
 
 def _extract_plain_text(raw: str) -> str:
-    """
-    Извлекает чистый текст из ответа Gemini.
-    Если модель всё же вернула JSON-объект (вида {"daily_summary": "..."}),
-    вытаскиваем значение первого строкового поля.
-    """
+    """Извлекает чистый текст из ответа, если модель вернула JSON-обёртку."""
     if not raw:
         return ""
 
     cleaned = raw.strip()
-
-    # Убираем markdown-обёртки
     if "```" in cleaned:
         parts = cleaned.split("```")
         cleaned = parts[1] if len(parts) > 1 else parts[0]
@@ -136,7 +129,6 @@ def _extract_plain_text(raw: str) -> str:
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
 
-    # Если это JSON-объект — вытаскиваем первое строковое значение
     if cleaned.startswith("{"):
         try:
             data = json.loads(cleaned)
@@ -144,14 +136,12 @@ def _extract_plain_text(raw: str) -> str:
                 for key in ("daily_summary", "summary", "text", "итог", "итог_дня"):
                     if key in data and isinstance(data[key], str):
                         return data[key].strip()
-                # Если ключ неизвестен — берём первое строковое значение
                 for v in data.values():
                     if isinstance(v, str):
                         return v.strip()
         except json.JSONDecodeError:
             pass
 
-    # Если это JSON-массив — склеиваем строки
     if cleaned.startswith("["):
         try:
             data = json.loads(cleaned)
@@ -162,8 +152,14 @@ def _extract_plain_text(raw: str) -> str:
         except json.JSONDecodeError:
             pass
 
-    # Иначе — просто текст
     return cleaned.strip().strip('"').strip("'")
+
+
+def _clean_text(text: str) -> str:
+    """Убирает эмодзи и опасные для JSON символы."""
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
+    text = text.replace('"', "'").replace("\\", "")
+    return text.strip()
 
 
 # ── Вызов Gemini ─────────────────────────────────────────────────
@@ -175,12 +171,7 @@ async def _gemini_call(
     max_tokens: int,
     json_mode: bool = True,
 ) -> str:
-    """
-    Один вызов Gemini через стабильный generate_content.
-
-    json_mode=True  — модель обязана вернуть валидный JSON.
-    json_mode=False — модель возвращает обычный текст (для «Итога дня»).
-    """
+    """Один вызов Gemini через стабильный generate_content."""
     config = {
         "system_instruction": system,
         "temperature": 0.3,
@@ -203,10 +194,7 @@ async def _gemini(
     max_tokens: int = 2000,
     json_mode: bool = True,
 ) -> str:
-    """
-    Вызов Gemini с retry и fallback.
-    json_mode прокидывается в _gemini_call.
-    """
+    """Вызов Gemini с retry и fallback."""
     models = [settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODEL]
     last_error = None
 
@@ -247,80 +235,81 @@ async def _gemini(
     status = getattr(last_error, "status_code", None) or getattr(last_error, "code", None)
     if status and status in _ERROR_HINTS:
         raise RuntimeError(_ERROR_HINTS[status]) from last_error
-    raise RuntimeError(f"⚠️ Ошибка Gemini API после всех попыток: {last_error}") from last_error
+    raise RuntimeError(f"⚠️ Gemini API error after all attempts: {last_error}") from last_error
 
 
 # ── Форматирование постов для промпта ────────────────────────────
 
 def _fmt_posts(posts) -> str:
+    """Компактное представление постов. Только 300 симв. текста + URL."""
     lines = []
     for i, p in enumerate(posts, 1):
         date_str = p.date.strftime("%d.%m %H:%M")
-        text = p.text[:400].replace(chr(10), " ")
-        lines.append(
-            f"[{i}] @{p.channel} | {date_str}\n"
-            f"{text}\n"
-            f"URL: {p.url}"
-        )
-    return "\n\n".join(lines)
+        text = _clean_text(p.text[:300]).replace(chr(10), " ")
+        lines.append(f"[{i}] @{p.channel} | {date_str} | {text} | URL: {p.url}")
+    return "\n".join(lines)
 
 
 # ── 1. Фильтрация Telegram-постов ────────────────────────────────
 
 _SYSTEM_PROMPT = (
-    "Ты — редактор персонального новостного дайджеста из Telegram-каналов.\n"
-    "Твоя задача — отобрать важные посты из ПРЕДОСТАВЛЕННОГО СПИСКА "
-    "и сжать их до коротких, информативных резюме.\n\n"
+    "You are an editor of a personal news digest from Telegram channels.\n"
+    "Your task: select important posts from the PROVIDED LIST and compress them "
+    "into short, informative summaries.\n\n"
 
-    "═══ ЖЁСТКИЕ ПРАВИЛА ═══\n\n"
+    "=== HARD RULES ===\n\n"
 
-    "1. ИСТОЧНИК ИНФОРМАЦИИ — только тексты постов из списка.\n"
-    "   • НЕ добавляй факты, имена, числа, даты и события, которых нет в постах.\n"
-    "   • НЕ используй свои знания о мире.\n"
-    "   • НЕ ищи новости в интернете.\n"
-    "   • Если в посте чего-то нет — не додумывай.\n\n"
+    "1. SOURCE OF TRUTH — only the post texts in the list.\n"
+    "   - Do NOT add facts, names, numbers, dates or events not present in the posts.\n"
+    "   - Do NOT use your own world knowledge.\n"
+    "   - Do NOT search the internet.\n"
+    "   - If something is missing in a post, do not invent it.\n\n"
 
-    "2. ДЕДУПЛИКАЦИЯ.\n"
-    "   • Если несколько постов описывают одно событие — объедини их в одну запись.\n"
-    "   • Сохрани различия в подаче: если каналы трактуют событие по-разному, "
-    "отметь это в поле framing.\n"
-    "   • В поле channel укажи все каналы через запятую.\n"
-    "   • В поле url — ссылку на самый содержательный пост.\n\n"
+    "2. DEDUPLICATION.\n"
+    "   - If several posts describe the same event, merge them into one entry.\n"
+    "   - Preserve differences in framing: if channels present the event "
+    "differently, note it in the 'framing' field.\n"
+    "   - In 'channel' list all channels separated by comma.\n"
+    "   - In 'url' use the link of the most informative post.\n\n"
 
-    "3. ФИЛЬТРАЦИЯ.\n"
-    "   Отбрасывай: рекламу, репосты без добавленной ценности, мемы, "
-    "поздравления, дубли, погоду, спорт без значимого контекста, "
-    "светскую хронику, локальные происшествия без широкого значения.\n\n"
+    "3. FILTERING.\n"
+    "   Discard: ads, low-value reposts, memes, greetings, duplicates, weather, "
+    "sports without significant context, celebrity news, local incidents "
+    "without broader significance.\n\n"
 
-    "4. ПРИОРИТЕТЫ (что считать важным):\n"
-    "   1) Технологии и AI — продукты, политика, бизнес\n"
-    "   2) Бизнес, стартапы, предпринимательство\n"
-    "   3) Экономика: рынки, макро, торговля, ставки\n"
-    "   4) Политические решения с реальными последствиями\n"
-    "   5) Регуляторные изменения (налоги, законы, санкции)\n"
-    "   6) Качественные аналитические посты, меняющие взгляд на тему\n\n"
+    "4. PRIORITIES (what counts as important):\n"
+    "   1) Technology & AI — products, policy, business\n"
+    "   2) Business, startups, entrepreneurship\n"
+    "   3) Economics: markets, macro, trade, rates\n"
+    "   4) Political decisions with real-world consequences\n"
+    "   5) Regulatory changes (taxes, laws, sanctions)\n"
+    "   6) High-quality analysis that shifts perspective\n\n"
 
-    "5. ФОРМАТ.\n"
-    "   • Отвечай СТРОГО JSON-массивом объектов.\n"
-    "   • Без markdown, без бэктиков, без пояснений до или после JSON.\n"
-    "   • Все текстовые поля — на русском языке.\n\n"
+    "5. LANGUAGE REQUIREMENT (CRITICAL).\n"
+    "   - ALL text field VALUES must be in RUSSIAN: title, summary, why, framing.\n"
+    "   - Field names and JSON structure stay in English.\n"
+    "   - The 'channel' field keeps @usernames as-is.\n"
+    "   - The 'url' field keeps URLs as-is.\n\n"
 
-    "═══ СХЕМА ОБЪЕКТА ═══\n\n"
+    "6. FORMAT.\n"
+    "   - Output STRICTLY a JSON array of objects.\n"
+    "   - No markdown, no backticks, no explanations before or after JSON.\n\n"
+
+    "=== OBJECT SCHEMA ===\n\n"
     "{\n"
-    '  "title":      "до 80 символов, конкретный, без кликбейта",\n'
-    '  "summary":    "1–2 предложения: что произошло. Только факты из поста.",\n'
-    '  "why":        "1 предложение: почему это важно.",\n'
-    '  "framing":    "различия в подаче между каналами (или пустая строка)",\n'
+    '  "title":      "up to 80 chars, RUSSIAN, specific, no clickbait",\n'
+    '  "summary":    "1-2 sentences, RUSSIAN, only facts from the post",\n'
+    '  "why":        "1 sentence, RUSSIAN, why it matters",\n'
+    '  "framing":    "differences in framing between channels, RUSSIAN, or empty string",\n'
     '  "importance": 1-10,\n'
-    '  "channel":    "@канал1, @канал2",\n'
-    '  "url":        "ссылка из поста или пустая строка"\n'
+    '  "channel":    "@channel1, @channel2",\n'
+    '  "url":        "link from post or empty string"\n'
     "}\n\n"
 
-    "═══ ОГРАНИЧЕНИЯ ═══\n\n"
-    "• Не более MAX_NEWS важных новостей (см. пользовательский запрос).\n"
-    "• Если подходящих постов меньше — верни меньше, НЕ добивай список мусором.\n"
-    "• Если все посты — мусор, верни пустой массив [].\n"
-    "• Не более 10 объектов в ответе, даже если постов много.\n"
+    "=== LIMITS ===\n\n"
+    "• Return no more than the requested number of important news items.\n"
+    "• If fewer qualify, return fewer — do NOT pad.\n"
+    "• If all posts are garbage, return [].\n"
 )
 
 
@@ -333,14 +322,15 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
     posts = posts[: settings.MAX_POSTS_TO_AI]
 
     user = (
-        f"Проанализируй {len(posts)} постов из Telegram-каналов пользователя.\n"
-        f"Отбери не более {settings.MAX_NEWS_IN_DIGEST} самых важных "
-        "и верни JSON-массив по схеме.\n\n"
-        f"Посты:\n{_fmt_posts(posts)}\n\n"
-        "Ответ — JSON-массив:"
+        f"Analyze {len(posts)} posts from user's Telegram channels.\n"
+        f"Select no more than {settings.MAX_NEWS_IN_DIGEST} most important "
+        "and return a JSON array.\n"
+        "REMINDER: all text values in Russian.\n\n"
+        f"Posts:\n{_fmt_posts(posts)}\n\n"
+        "JSON:"
     )
 
-    max_tokens = 700 + settings.MAX_NEWS_IN_DIGEST * 350
+    max_tokens = 500 + settings.MAX_NEWS_IN_DIGEST * 300
 
     try:
         raw = await _gemini(_SYSTEM_PROMPT, user, max_tokens=max_tokens, json_mode=True)
@@ -371,7 +361,7 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
         return [], str(e)
     except Exception as e:
         logger.error("summarize_posts unexpected: %s", e, exc_info=True)
-        return [], f"⚠️ Ошибка: {e}"
+        return [], f"⚠️ Error: {e}"
 
 
 # ── 2. Веб-новости (не используется, оставлено для совместимости) ─
@@ -381,22 +371,20 @@ async def fetch_web_news(
     lang: str = "ru",
 ) -> tuple[list[DigestItem], Optional[str]]:
     """По умолчанию НЕ вызывается. Оставлено для совместимости."""
-    lang_str = "русский" if lang == "ru" else "english"
     system = (
-        "Ты редактор новостного дайджеста. Составь список важных новостей.\n"
-        "Ответ — JSON-массив. Без markdown."
+        "You are a news digest editor. Compile a list of important news.\n"
+        "Output a JSON array. All text values in Russian. No markdown."
     )
     user = (
-        f"Составь {settings.MAX_NEWS_IN_DIGEST} важных новостей по теме: {topic}.\n"
-        f"Язык: {lang_str}.\n"
-        'Поля: "title", "summary", "why", "importance" (1-10), "source", "url".\n'
+        f"Compile {settings.MAX_NEWS_IN_DIGEST} important news on: {topic}.\n"
+        'Fields: "title", "summary", "why", "importance" (1-10), "source", "url".\n'
         "JSON:"
     )
 
     try:
         raw = await _gemini(
             system, user,
-            max_tokens=700 + settings.MAX_NEWS_IN_DIGEST * 350,
+            max_tokens=500 + settings.MAX_NEWS_IN_DIGEST * 300,
             json_mode=True,
         )
         data = _extract_json_array(raw)
@@ -422,40 +410,35 @@ async def fetch_web_news(
         return [], None
 
 
-# ── 3. Итог дня (чистый текст, без JSON) ─────────────────────────
+# ── 3. Итог дня (чистый текст на русском) ────────────────────────
 
 async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str:
-    """
-    Генерирует «Итог дня» как обычный текст.
-    json_mode=False, чтобы модель не оборачивала ответ в JSON.
-    """
+    """Генерирует «Итог дня» как обычный текст на русском."""
     if not items:
         return ""
 
     digest_text = "\n".join(
         f"• [{i.importance}/10] {i.title} — {i.summary}" for i in items
     )
-    lang_str = "русский" if lang == "ru" else "english"
 
     system = (
-        f"Ты аналитик новостей. Напиши связный ИТОГ ДНЯ — 3-5 предложений "
-        f"о том, что главное произошло. Используй ТОЛЬКО перечисленные ниже "
-        f"новости, не добавляй факты из своих знаний.\n\n"
-        f"Язык: {lang_str}.\n"
-        f"Стиль: деловой, без вводных фраз вроде «сегодня», «в этот день».\n"
-        f"Формат: обычный текст. НЕ используй JSON, кавычки, markdown, "
-        f"заголовки, ключи вида \"daily_summary\".\n"
-        f"Просто напиши 3-5 предложений подряд."
+        "You are a news analyst. Write a coherent DAY SUMMARY — 3-5 sentences "
+        "about what happened. Use ONLY the listed news items, do NOT add facts "
+        "from your own knowledge.\n\n"
+        "CRITICAL:\n"
+        "  - Output language: RUSSIAN.\n"
+        "  - Style: business, neutral. Avoid filler like «сегодня», «в этот день».\n"
+        "  - Format: plain text. NO JSON, NO quotes, NO markdown, NO keys "
+        "like \"daily_summary\".\n"
+        "  - Just 3-5 sentences in Russian, nothing else."
     )
     user = (
-        f"Новости дня:\n{digest_text}\n\n"
-        "Напиши ИТОГ ДНЯ (обычный текст, 3-5 предложений):"
+        f"News of the day:\n{digest_text}\n\n"
+        "Write DAY SUMMARY (plain Russian text, 3-5 sentences):"
     )
 
     try:
-        # json_mode=False — модель вернёт чистый текст
-        summary = await _gemini(system, user, max_tokens=600, json_mode=False)
-        # На случай если модель всё равно вернула JSON — вытащим текст
+        summary = await _gemini(system, user, max_tokens=500, json_mode=False)
         summary = _extract_plain_text(summary)
         return summary
     except RuntimeError as e:
@@ -516,7 +499,6 @@ def format_digest_message(
         return "📭 Новостей нет — всё тихо." if lang == "ru" else "📭 No news — all quiet."
 
     if day_summary:
-        # Никаких <i>...</i> вокруг — просто аккуратный абзац
         parts.append(f"\n\n📊 <b>Итог дня</b>\n{_he(day_summary)}")
 
     if api_error:
