@@ -1,12 +1,11 @@
 """
 summarizer.py — Google Gemini через стабильный generate_content API.
 
-Стратегия оптимизации:
-  - Промпты на английском → ~2-3x меньше токенов на входе.
-  - Все выходные текстовые поля — на русском (жёстко зафиксировано).
-  - Устойчивый парсинг JSON (выдерживает обрезанные ответы).
-  - Retry + fallback на резервную модель.
-  - json_mode включается только там, где нужен JSON.
+Изменения:
+  - УДАЛЕН «Итог дня» (generate_day_summary).
+  - Расширен охват: MAX_POSTS_TO_AI=70, MAX_NEWS_IN_DIGEST=15, POST_TEXT_LIMIT=500.
+  - Промпты на английском для экономии токенов, вывод — на русском.
+  - Устойчивый парсинг JSON, retry + fallback.
 """
 import asyncio
 import json
@@ -116,45 +115,6 @@ def _repair_json_chunk(chunk: str) -> str:
     return fixed
 
 
-def _extract_plain_text(raw: str) -> str:
-    """Извлекает чистый текст из ответа, если модель вернула JSON-обёртку."""
-    if not raw:
-        return ""
-
-    cleaned = raw.strip()
-    if "```" in cleaned:
-        parts = cleaned.split("```")
-        cleaned = parts[1] if len(parts) > 1 else parts[0]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
-
-    if cleaned.startswith("{"):
-        try:
-            data = json.loads(cleaned)
-            if isinstance(data, dict):
-                for key in ("daily_summary", "summary", "text", "итог", "итог_дня"):
-                    if key in data and isinstance(data[key], str):
-                        return data[key].strip()
-                for v in data.values():
-                    if isinstance(v, str):
-                        return v.strip()
-        except json.JSONDecodeError:
-            pass
-
-    if cleaned.startswith("["):
-        try:
-            data = json.loads(cleaned)
-            if isinstance(data, list):
-                parts = [str(x) for x in data if isinstance(x, (str, int, float))]
-                if parts:
-                    return " ".join(parts).strip()
-        except json.JSONDecodeError:
-            pass
-
-    return cleaned.strip().strip('"').strip("'")
-
-
 def _clean_text(text: str) -> str:
     """Убирает эмодзи и опасные для JSON символы."""
     text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
@@ -241,11 +201,12 @@ async def _gemini(
 # ── Форматирование постов для промпта ────────────────────────────
 
 def _fmt_posts(posts) -> str:
-    """Компактное представление постов. Только 300 симв. текста + URL."""
+    """Компактное представление постов для промпта."""
+    limit = settings.POST_TEXT_LIMIT
     lines = []
     for i, p in enumerate(posts, 1):
         date_str = p.date.strftime("%d.%m %H:%M")
-        text = _clean_text(p.text[:300]).replace(chr(10), " ")
+        text = _clean_text(p.text[:limit]).replace(chr(10), " ")
         lines.append(f"[{i}] @{p.channel} | {date_str} | {text} | URL: {p.url}")
     return "\n".join(lines)
 
@@ -330,7 +291,8 @@ async def summarize_posts(posts) -> tuple[list[DigestItem], Optional[str]]:
         "JSON:"
     )
 
-    max_tokens = 500 + settings.MAX_NEWS_IN_DIGEST * 300
+    # Щедрый лимит: 700 базовых + 350 на каждую новость
+    max_tokens = 700 + settings.MAX_NEWS_IN_DIGEST * 350
 
     try:
         raw = await _gemini(_SYSTEM_PROMPT, user, max_tokens=max_tokens, json_mode=True)
@@ -410,46 +372,7 @@ async def fetch_web_news(
         return [], None
 
 
-# ── 3. Итог дня (чистый текст на русском) ────────────────────────
-
-async def generate_day_summary(items: list[DigestItem], lang: str = "ru") -> str:
-    """Генерирует «Итог дня» как обычный текст на русском."""
-    if not items:
-        return ""
-
-    digest_text = "\n".join(
-        f"• [{i.importance}/10] {i.title} — {i.summary}" for i in items
-    )
-
-    system = (
-        "You are a news analyst. Write a coherent DAY SUMMARY — 3-5 sentences "
-        "about what happened. Use ONLY the listed news items, do NOT add facts "
-        "from your own knowledge.\n\n"
-        "CRITICAL:\n"
-        "  - Output language: RUSSIAN.\n"
-        "  - Style: business, neutral. Avoid filler like «сегодня», «в этот день».\n"
-        "  - Format: plain text. NO JSON, NO quotes, NO markdown, NO keys "
-        "like \"daily_summary\".\n"
-        "  - Just 3-5 sentences in Russian, nothing else."
-    )
-    user = (
-        f"News of the day:\n{digest_text}\n\n"
-        "Write DAY SUMMARY (plain Russian text, 3-5 sentences):"
-    )
-
-    try:
-        summary = await _gemini(system, user, max_tokens=500, json_mode=False)
-        summary = _extract_plain_text(summary)
-        return summary
-    except RuntimeError as e:
-        logger.warning("day_summary skipped: %s", e)
-        return ""
-    except Exception as e:
-        logger.error("day_summary error: %s", e)
-        return ""
-
-
-# ── 4. Форматирование для Telegram ───────────────────────────────
+# ── 3. Форматирование для Telegram ───────────────────────────────
 
 def _he(t: str) -> str:
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -479,10 +402,13 @@ def _item_html(item: DigestItem) -> str:
 def format_digest_message(
     tg_items: list[DigestItem],
     web_items: list[DigestItem],
-    day_summary: str,
     api_error: Optional[str] = None,
     lang: str = "ru",
 ) -> str:
+    """
+    Собирает финальное сообщение дайджеста.
+    «Итог дня» УДАЛЁН — параметр day_summary больше не принимается.
+    """
     parts = []
 
     if tg_items:
@@ -497,9 +423,6 @@ def format_digest_message(
 
     if not parts:
         return "📭 Новостей нет — всё тихо." if lang == "ru" else "📭 No news — all quiet."
-
-    if day_summary:
-        parts.append(f"\n\n📊 <b>Итог дня</b>\n{_he(day_summary)}")
 
     if api_error:
         parts.append(f"\n\n⚠️ <i>{_he(api_error)}</i>")
