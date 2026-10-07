@@ -1,8 +1,11 @@
 """
 scheduler.py — тик каждую минуту.
 
-Кеширование статей УДАЛЕНО: нет вызовов db.cache_article().
-Расписание в settings.TIMEZONE (по умолчанию Europe/Moscow).
+Изменения:
+  - «Итог дня» УДАЛЁН: generate_day_summary больше не вызывается.
+  - В format_digest_message больше не передаётся day_summary.
+  - В log_digest больше не пишется summary.
+  - Веб-новости по-прежнему отключены.
 """
 import asyncio
 import logging
@@ -17,7 +20,6 @@ from config import settings
 from database import Database
 from summarizer import (
     summarize_posts,
-    generate_day_summary,
     format_digest_message,
 )
 
@@ -102,18 +104,10 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
         logger.info("User %d: nothing to send.", user_id)
         return
 
-    # 3. Итог дня
-    day_summary = ""
-    if all_items:
-        day_summary = await generate_day_summary(
-            all_items, lang=settings.DIGEST_LANGUAGE
-        )
-
-    # 4. Отправка
+    # 3. Отправка
     msg = format_digest_message(
         tg_items=tg_items,
         web_items=web_items,
-        day_summary=day_summary,
         api_error=api_error,
         lang=settings.DIGEST_LANGUAGE,
     )
@@ -129,7 +123,7 @@ async def _send_user_digest(bot, db, client, user_id, channels, since_hours):
             logger.error("Failed to send chunk to %d: %s", user_id, e)
         await asyncio.sleep(0.3)
 
-    await db.log_digest(user_id, len(all_items), day_summary)
+    await db.log_digest(user_id, len(all_items))
     logger.info("User %d: sent %d items (tg=%d).",
                 user_id, len(all_items), len(tg_items))
 
