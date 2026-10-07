@@ -12,20 +12,19 @@ class Settings(BaseSettings):
     GEMINI_MAX_RETRIES: int = 5
     GEMINI_RETRY_DELAY: float = 2.0
 
-    # Часовой пояс для расписания (IANA name).
-    # Все времена в команде /schedule интерпретируются в этом поясе.
+    # Часовой пояс для расписания
     TIMEZONE: str = "Europe/Moscow"
 
-    # Дайджест
+    # Дайджест — расширенный охват новостей
     DEFAULT_DIGEST_INTERVAL_HOURS: int = 4
-    POSTS_PER_CHANNEL: int = 25
-    MAX_NEWS_IN_DIGEST: int = 25
-    MAX_POSTS_TO_AI: int = 50
+    POSTS_PER_CHANNEL: int = 20
+    MAX_NEWS_IN_DIGEST: int = 15         # было 10, теперь 15
+    MAX_POSTS_TO_AI: int = 70            # было 50, теперь 70
+    POST_TEXT_LIMIT: int = 500           # было 300, теперь 500
     DIGEST_LANGUAGE: str = "ru"
     DB_PATH: str = "bot_data.db"
 
-    # Веб-новости — по умолчанию ОТКЛЮЧЕНЫ.
-    # Бот работает только с постами из каналов пользователя.
+    # Веб-новости — по умолчанию ОТКЛЮЧЕНЫ
     INCLUDE_WEB_NEWS: bool = False
     WEB_NEWS_TOPIC: str = "главные мировые и российские новости дня"
 
